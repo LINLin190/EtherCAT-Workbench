@@ -1,0 +1,27 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 1, 0, 0),
+    prodvers=(0, 1, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '080404b0',
+        [StringStruct('CompanyName', 'LINLin640'),
+         StringStruct('FileDescription', 'EtherCAT Workbench'),
+         StringStruct('FileVersion', '0.1.0'),
+         StringStruct('InternalName', 'EtherCATWorkbench'),
+         StringStruct('LegalCopyright', 'Copyright (c) 2026 LINLin640'),
+         StringStruct('OriginalFilename', 'EtherCATWorkbench.exe'),
+         StringStruct('ProductName', 'EtherCAT Workbench'),
+         StringStruct('ProductVersion', '0.1.0')])
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)

@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+from ..backends.base import EtherCatBackend
+from ..models import AccessSemantics, RegisterRead
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterDefinition:
+    address: int
+    width: int
+    name: str
+    access: AccessSemantics
+    group: str
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterWritePlan:
+    position: int
+    address: int
+    semantics: AccessSemantics
+    current: bytes
+    target: bytes
+    changed_mask: bytes
+    known_register: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterWriteResult:
+    fpwr_wkc: int
+    readback: bytes | None
+    verified: bool | None
+    conclusion: str
+
+
+def changed_mask(current: bytes, target: bytes) -> bytes:
+    if len(current) != len(target):
+        raise ValueError("Current and target widths differ")
+    return bytes(a ^ b for a, b in zip(current, target, strict=True))
+
+
+class RegisterService:
+    def __init__(self, backend: EtherCatBackend) -> None:
+        self.backend = backend
+
+    def read(self, position: int, address: int, size: int, timeout_us: int = 2000) -> RegisterRead:
+        if not 1 <= size <= 256 or not 0 <= address <= 0xFFFF or address + size > 0x10000:
+            raise ValueError("Register read must stay within 0x0000–0xFFFF and be 1–256 bytes")
+        started = time.perf_counter()
+        data = self.backend.register_read(position, address, size, timeout_us)
+        return RegisterRead(position, address, data, 1, (time.perf_counter() - started) * 1000, time.time())
+
+    def read_merged(
+        self, requests: Iterable[tuple[int, int]], position: int, timeout_us: int = 2000
+    ) -> dict[tuple[int, int], RegisterRead]:
+        ordered = sorted(set(requests))
+        for address, size in ordered:
+            if not 1 <= size <= 256 or address < 0 or address + size > 0x10000:
+                raise ValueError("Invalid register watch range")
+        groups: list[tuple[int, int, list[tuple[int, int]]]] = []
+        for request in ordered:
+            address, size = request
+            if (
+                groups
+                and address <= groups[-1][1]
+                and max(groups[-1][1], address + size) - groups[-1][0] <= 256
+            ):
+                start, end, members = groups[-1]
+                groups[-1] = start, max(end, address + size), members + [request]
+            else:
+                groups.append((address, address + size, [request]))
+        result: dict[tuple[int, int], RegisterRead] = {}
+        for start, end, members in groups:
+            merged = self.read(position, start, end - start, timeout_us)
+            for address, size in members:
+                offset = address - start
+                result[(address, size)] = RegisterRead(
+                    position,
+                    address,
+                    merged.data[offset : offset + size],
+                    1,
+                    merged.duration_ms,
+                    merged.timestamp,
+                )
+        return result
+
+    def prepare_write(
+        self,
+        position: int,
+        address: int,
+        target: bytes,
+        semantics: AccessSemantics,
+        known_register: bool,
+        timeout_us: int = 2000,
+    ) -> RegisterWritePlan:
+        if semantics is AccessSemantics.RO:
+            raise PermissionError("Read-only register cannot be written")
+        if not target:
+            raise ValueError("Register write data cannot be empty")
+        current = self.read(position, address, len(target), timeout_us).data
+        return RegisterWritePlan(
+            position,
+            address,
+            semantics,
+            current,
+            bytes(target),
+            changed_mask(current, target),
+            known_register,
+        )
+
+    def execute_write(self, plan: RegisterWritePlan, timeout_us: int = 2000) -> RegisterWriteResult:
+        current = self.read(plan.position, plan.address, len(plan.target), timeout_us).data
+        if current != plan.current:
+            raise RuntimeError("Register changed after editing; refresh the write plan and confirm again")
+        self.backend.register_write(plan.position, plan.address, plan.target, timeout_us)
+        if plan.semantics in {AccessSemantics.WO, AccessSemantics.SELF_CLEARING}:
+            return RegisterWriteResult(1, None, None, "FPWR 成功，无法通过静态回读确认语义结果")
+        readback = self.read(plan.position, plan.address, len(plan.target), timeout_us).data
+        if plan.semantics is AccessSemantics.RW:
+            valid = readback == plan.target
+        elif plan.semantics is AccessSemantics.W1C:
+            valid = all(
+                (actual & requested) == 0 for actual, requested in zip(readback, plan.target, strict=True)
+            )
+        elif plan.semantics is AccessSemantics.W1S:
+            valid = all(
+                (actual & requested) == requested
+                for actual, requested in zip(readback, plan.target, strict=True)
+            )
+        elif plan.semantics is AccessSemantics.VOLATILE:
+            return RegisterWriteResult(1, readback, None, "FPWR 成功；寄存器易变，不执行整值相等判断")
+        else:
+            valid = False
+        return RegisterWriteResult(1, readback, valid, "写入并验证成功" if valid else "写入后校验失败")
+
+
+class ResetService:
+    """Must be called as one exclusive worker task after EEPROM image verification."""
+
+    def __init__(self, backend: EtherCatBackend) -> None:
+        self.backend = backend
+
+    def reset_ecat(self, position: int, timeout_us: int = 2000) -> tuple[bool, bool, bool]:
+        results: list[bool] = []
+        for byte in b"RES":
+            self.backend.register_write(position, 0x0040, bytes([byte]), timeout_us)
+            results.append(True)
+        return tuple(results)  # type: ignore[return-value]
