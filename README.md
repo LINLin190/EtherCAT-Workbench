@@ -61,7 +61,7 @@ EtherCAT Workbench 是一款便携、易用的 **EtherCAT 从站调试工具**�
 
 ### 安装与启动
 
-从项目的 [GitHub Releases](https://github.com/LINLin640/EtherCAT-Workbench/releases) 下载：
+从项目的 [GitHub Releases](https://github.com/LINLin190/EtherCAT-Workbench/releases) 下载：
 
 ```text
 EtherCATWorkbench-<版本>-Setup-x64.exe
@@ -225,7 +225,7 @@ E101、E252、E253 始终显示为独立国产 ESC，不显示成原厂 ET1100�
 在 PowerShell 中执行：
 
 ```powershell
-git clone https://github.com/LINLin640/EtherCAT-Workbench.git
+git clone https://github.com/LINLin190/EtherCAT-Workbench.git
 cd EtherCAT-Workbench
 
 py -3.11 -m venv .venv
@@ -349,7 +349,7 @@ EtherCAT Workbench 按 [PolyForm Noncommercial License 1.0.0](LICENSE.md) 发布
 
 欢迎参与改进 EtherCAT Workbench：
 
-- 通过 [GitHub Issues](https://github.com/LINLin640/EtherCAT-Workbench/issues) 报告缺陷或提出功能建议；
+- 通过 [GitHub Issues](https://github.com/LINLin190/EtherCAT-Workbench/issues) 报告缺陷或提出功能建议；
 - 补充经过明确标注的真实硬件只读验证结果；
 - Fork 仓库，创建范围清晰的修复分支并提交 Pull Request；
 - 改进 ESI/SII 兼容性、ESC 寄存器定义、Mock 数据、测试或文档。

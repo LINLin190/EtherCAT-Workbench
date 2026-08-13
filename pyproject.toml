@@ -21,8 +21,8 @@ dev = ["pyinstaller>=6.10,<7", "pytest>=8", "pytest-qt>=4.4", "ruff>=0.6"]
 ethercat-workbench = "ethercat_debug_tool.app:main"
 
 [project.urls]
-Repository = "https://github.com/LINLin640/EtherCAT-Workbench"
-Issues = "https://github.com/LINLin640/EtherCAT-Workbench/issues"
+Repository = "https://github.com/LINLin190/EtherCAT-Workbench"
+Issues = "https://github.com/LINLin190/EtherCAT-Workbench/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

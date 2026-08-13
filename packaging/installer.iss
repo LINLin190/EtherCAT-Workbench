@@ -10,9 +10,9 @@
 AppId={{D37C82B2-81A3-43C0-B346-D2DEAE56AA28}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppPublisher=LINLin640
-AppPublisherURL=https://github.com/LINLin640/EtherCAT-Workbench
-AppSupportURL=https://github.com/LINLin640/EtherCAT-Workbench/issues
+AppPublisher=LINLin190
+AppPublisherURL=https://github.com/LINLin190/EtherCAT-Workbench
+AppSupportURL=https://github.com/LINLin190/EtherCAT-Workbench/issues
 LicenseFile=..\LICENSE.md
 DefaultDirName={autopf}\EtherCAT Workbench
 DefaultGroupName={#MyAppName}

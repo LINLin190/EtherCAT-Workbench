@@ -72,6 +72,6 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 
 **Use** means anything you do with the software requiring one of your licenses.
 
-Required Notice: Copyright (c) 2026 LINLin640.
+Required Notice: Copyright (c) 2026 LINLin190.
 
-Required Notice: Original project: https://github.com/LINLin640/EtherCAT-Workbench
+Required Notice: Original project: https://github.com/LINLin190/EtherCAT-Workbench

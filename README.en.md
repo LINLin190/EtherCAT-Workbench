@@ -79,7 +79,7 @@ It does not generate vendor-private Categories, the complete custom DataTypes di
 Run the following commands in PowerShell:
 
 ```powershell
-git clone https://github.com/LINLin640/EtherCAT-Workbench.git
+git clone https://github.com/LINLin190/EtherCAT-Workbench.git
 cd EtherCAT-Workbench
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -146,4 +146,4 @@ Bundled third-party components remain subject to their respective licenses. See 
 
 ## Contributing
 
-[GitHub Issues](https://github.com/LINLin640/EtherCAT-Workbench/issues) are welcome for bug reports, feature requests, and physical-hardware validation results. You are also welcome to fork the repository, create a focused fix branch, and submit a pull request. Please describe the problem, scope, verification, and affected EtherCAT slave or ESC model. Do not contribute automated tests that write real EEPROM, PDO outputs, or registers.
+[GitHub Issues](https://github.com/LINLin190/EtherCAT-Workbench/issues) are welcome for bug reports, feature requests, and physical-hardware validation results. You are also welcome to fork the repository, create a focused fix branch, and submit a pull request. Please describe the problem, scope, verification, and affected EtherCAT slave or ESC model. Do not contribute automated tests that write real EEPROM, PDO outputs, or registers.
