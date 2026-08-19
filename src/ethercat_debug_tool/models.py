@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import Any
 
 
 class BackendMode(StrEnum):
@@ -102,19 +101,8 @@ class ProcessDataSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class LogRecord:
-    timestamp: float
-    level: str
-    source: str
-    event: str
-    message: str
-    details: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
 class EepromBackup:
     binary_path: Path
-    metadata_path: Path
     sha256: str
     size: int
 
@@ -144,5 +132,6 @@ class AccessSemantics(StrEnum):
     WO = "WO"
     W1C = "W1C"
     W1S = "W1S"
+    WAC = "WAC"
     SELF_CLEARING = "SELF_CLEARING"
     VOLATILE = "VOLATILE"

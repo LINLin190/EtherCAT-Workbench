@@ -95,27 +95,39 @@ class RegisterService:
         target: bytes,
         semantics: AccessSemantics,
         known_register: bool,
+        expected_width: int | None = None,
+        expected_semantics: AccessSemantics | None = None,
         timeout_us: int = 2000,
     ) -> RegisterWritePlan:
         if semantics is AccessSemantics.RO:
             raise PermissionError("Read-only register cannot be written")
-        if not target:
-            raise ValueError("Register write data cannot be empty")
-        current = self.read(position, address, len(target), timeout_us).data
+        if not 1 <= len(target) <= 256 or address < 0 or address + len(target) > 0x10000:
+            raise ValueError("Register write must stay within 0x0000–0xFFFF and be 1–256 bytes")
+        if known_register and expected_width is not None and len(target) != expected_width:
+            raise ValueError(f"Known register write must be exactly {expected_width} bytes")
+        if known_register and expected_semantics is not None and semantics is not expected_semantics:
+            raise ValueError("Known register access semantics do not match the catalog definition")
+        # A write-only register cannot be read safely (and some ESCs reject the
+        # FPRD outright).  Other semantics still get a fresh value for the
+        # confirmation dialog and concurrent-change guard.
+        current = (
+            b"" if semantics is AccessSemantics.WO else self.read(position, address, len(target), timeout_us).data
+        )
         return RegisterWritePlan(
             position,
             address,
             semantics,
             current,
             bytes(target),
-            changed_mask(current, target),
+            b"" if semantics is AccessSemantics.WO else changed_mask(current, target),
             known_register,
         )
 
     def execute_write(self, plan: RegisterWritePlan, timeout_us: int = 2000) -> RegisterWriteResult:
-        current = self.read(plan.position, plan.address, len(plan.target), timeout_us).data
-        if current != plan.current:
-            raise RuntimeError("Register changed after editing; refresh the write plan and confirm again")
+        if plan.semantics is not AccessSemantics.WO:
+            current = self.read(plan.position, plan.address, len(plan.target), timeout_us).data
+            if current != plan.current:
+                raise RuntimeError("Register changed after editing; refresh the write plan and confirm again")
         self.backend.register_write(plan.position, plan.address, plan.target, timeout_us)
         if plan.semantics in {AccessSemantics.WO, AccessSemantics.SELF_CLEARING}:
             return RegisterWriteResult(1, None, None, "FPWR 成功，无法通过静态回读确认语义结果")
@@ -131,6 +143,8 @@ class RegisterService:
                 (actual & requested) == requested
                 for actual, requested in zip(readback, plan.target, strict=True)
             )
+        elif plan.semantics is AccessSemantics.WAC:
+            valid = all(actual == 0 for actual in readback)
         elif plan.semantics is AccessSemantics.VOLATILE:
             return RegisterWriteResult(1, readback, None, "FPWR 成功；寄存器易变，不执行整值相等判断")
         else:

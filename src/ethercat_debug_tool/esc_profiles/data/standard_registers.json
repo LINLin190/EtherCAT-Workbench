@@ -15,7 +15,18 @@
   {"address": 288, "width": 2, "name": "AL Control", "group": "Application Layer", "access": "RW", "description": "Requested AL state", "bit_fields": [{"name": "State", "shift": 0, "bits": 4}, {"name": "Error acknowledge", "shift": 4, "bits": 1}, {"name": "Device ID request", "shift": 5, "bits": 1}]},
   {"address": 304, "width": 2, "name": "AL Status", "group": "Application Layer", "access": "RO", "description": "Actual AL state", "bit_fields": [{"name": "State", "shift": 0, "bits": 4}, {"name": "Error", "shift": 4, "bits": 1}, {"name": "Device ID loaded", "shift": 5, "bits": 1}]},
   {"address": 308, "width": 2, "name": "AL Status Code", "group": "Application Layer", "access": "RO", "description": "AL error code"},
-  {"address": 768, "width": 8, "name": "RX Error Counter Port 0", "group": "Error Counters", "access": "W1C", "description": "Receive error counters"},
+  {"address": 516, "width": 2, "name": "AL Event Mask", "group": "Application Layer", "access": "RW", "description": "Masks AL events routed to the PDI IRQ signal"},
+  {"address": 544, "width": 2, "name": "AL Event Request", "group": "Application Layer", "access": "W1C", "description": "AL event flags; write 1 to the affected bits to acknowledge and clear them"},
+  {"address": 320, "width": 2, "name": "PDI Control", "group": "PDI", "access": "RW", "description": "PDI type and transfer mode; changing it can immediately break host access"},
+  {"address": 336, "width": 2, "name": "PDI Configuration", "group": "PDI", "access": "RW", "description": "PDI interface configuration, normally initialised from EEPROM"},
+  {"address": 768, "width": 1, "name": "RX Error Counter Port 0", "group": "Error Counters", "access": "WAC", "description": "Receive error counter port 0; writing any value resets it to 0"},
+  {"address": 769, "width": 1, "name": "RX Error Counter Port 1", "group": "Error Counters", "access": "WAC", "description": "Receive error counter port 1; writing any value resets it to 0"},
+  {"address": 770, "width": 1, "name": "RX Error Counter Port 2", "group": "Error Counters", "access": "WAC", "description": "Receive error counter port 2; writing any value resets it to 0"},
+  {"address": 771, "width": 1, "name": "RX Error Counter Port 3", "group": "Error Counters", "access": "WAC", "description": "Receive error counter port 3; writing any value resets it to 0"},
+  {"address": 772, "width": 1, "name": "TX Error Counter Port 0", "group": "Error Counters", "access": "WAC", "description": "Transmit error counter port 0; writing any value resets it to 0"},
+  {"address": 773, "width": 1, "name": "TX Error Counter Port 1", "group": "Error Counters", "access": "WAC", "description": "Transmit error counter port 1; writing any value resets it to 0"},
+  {"address": 774, "width": 1, "name": "TX Error Counter Port 2", "group": "Error Counters", "access": "WAC", "description": "Transmit error counter port 2; writing any value resets it to 0"},
+  {"address": 775, "width": 1, "name": "TX Error Counter Port 3", "group": "Error Counters", "access": "WAC", "description": "Transmit error counter port 3; writing any value resets it to 0"},
   {"address": 1024, "width": 2, "name": "Watchdog Divider", "group": "Watchdog", "access": "RW", "description": "Watchdog divider"},
   {"address": 1040, "width": 2, "name": "PDI Watchdog Time", "group": "Watchdog", "access": "RW", "description": "PDI watchdog"},
   {"address": 1056, "width": 2, "name": "Process Data Watchdog Time", "group": "Watchdog", "access": "RW", "description": "Process data watchdog"},
@@ -23,6 +34,6 @@
   {"address": 1282, "width": 2, "name": "EEPROM Control/Status", "group": "EEPROM", "access": "RW", "description": "EEPROM command and status", "bit_fields": [{"name": "Busy", "shift": 15, "bits": 1}, {"name": "Checksum error", "shift": 11, "bits": 1}, {"name": "Loading status", "shift": 12, "bits": 1}, {"name": "Command", "shift": 8, "bits": 3}]},
   {"address": 1536, "width": 16, "name": "FMMU 0", "group": "FMMU", "access": "RW", "description": "First FMMU configuration block"},
   {"address": 2048, "width": 8, "name": "Sync Manager 0", "group": "Sync Manager", "access": "RW", "description": "First Sync Manager configuration block"},
-  {"address": 2304, "width": 8, "name": "DC Receive Time Port 0", "group": "Distributed Clocks", "access": "VOLATILE", "description": "Receive time"},
-  {"address": 2320, "width": 8, "name": "DC System Time", "group": "Distributed Clocks", "access": "VOLATILE", "description": "Local system time"}
+  {"address": 2304, "width": 4, "name": "DC Receive Time Port 0", "group": "Distributed Clocks", "access": "RO", "volatile": true, "description": "Volatile receive timestamp; use the raw tool only for the documented latch command"},
+  {"address": 2320, "width": 8, "name": "DC System Time", "group": "Distributed Clocks", "access": "RO", "volatile": true, "description": "Volatile local system time; direct adjustment is intentionally kept in the raw tool"}
 ]

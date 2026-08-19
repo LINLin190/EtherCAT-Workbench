@@ -1,33 +1,19 @@
 # Third-Party Notices
 
-EtherCAT Workbench includes or depends on third-party software. The project license does not replace or restrict the licenses of those components. Complete license texts for bundled components are installed under `_internal\licenses` in the frozen Windows application.
+EtherCAT Workbench depends on third-party software whose own licenses continue to apply.
 
-## pySOEM 1.1.13
+| Component | Project | License |
+| --- | --- | --- |
+| Tauri 2 | https://tauri.app/ | Apache-2.0 / MIT |
+| React | https://react.dev/ | MIT |
+| Material UI | https://mui.com/ | MIT |
+| Emotion | https://emotion.sh/ | MIT |
+| Vite | https://vite.dev/ | MIT |
+| pySOEM 1.1.13 | https://github.com/bnjmnp/pysoem | MIT |
+| Python | https://www.python.org/ | PSF License |
 
-Project: <https://github.com/bnjmnp/pysoem>
-
-License: MIT
-
-Copyright (c) 2021 bnjmnp
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-## Qt for Python / PySide6 / Shiboken6
-
-Project: <https://doc.qt.io/qtforpython-6/>
-
-The Community Edition is available under LGPLv3/GPLv3 and applicable component licenses. EtherCAT Workbench uses the unmodified dynamically linked libraries shipped by the official PySide6 wheels. See the installed `_internal\licenses` directory and the [Qt for Python license documentation](https://doc.qt.io/qtforpython-6/licenses.html).
-
-## Python and PyInstaller
-
-The frozen Windows application contains the Python runtime and the PyInstaller bootloader. Their license texts and notices are included in the installed `_internal\licenses` directory.
+The dependency lockfiles are the authoritative component/version inventory for a build. Distribution tooling must collect the corresponding license texts when producing a bundle.
 
 ## Npcap
 
-Website: <https://npcap.com/>
-
-Npcap is detected at runtime but is not included or redistributed with EtherCAT Workbench. If required, the user explicitly chooses whether to download the free installer from the official Npcap website and accepts Npcap's own license terms separately.
+Npcap is a separately installed system dependency for Real mode. It is not included or redistributed by this repository. Users obtain it from https://npcap.com/ and accept its license separately.

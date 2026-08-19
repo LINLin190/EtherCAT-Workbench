@@ -11,6 +11,7 @@ from enum import IntEnum
 from typing import Any
 
 from ..backends.base import EtherCatBackend
+from ..models import EtherCatState
 
 
 class Priority(IntEnum):
@@ -50,6 +51,7 @@ class EtherCatWorker:
         self._cycle_timeout_us = 2000
         self._next_cycle = 0.0
         self._max_consecutive_errors = 5
+        self._needs_safe_state = False
 
     @property
     def is_alive(self) -> bool:
@@ -96,13 +98,18 @@ class EtherCatWorker:
     @staticmethod
     def _configure_cycle(
         backend: EtherCatBackend, period_ms: float, timeout_us: int, max_consecutive_errors: int
-    ) -> tuple[float, int, int]:
+    ) -> tuple[float, int, int, object, object]:
+        if period_ms <= 0:
+            raise ValueError("Cycle period must be positive")
         backend.map_process_data()
-        return period_ms / 1000.0, timeout_us, max_consecutive_errors
+        backend.request_state(None, EtherCatState.SAFE_OP, 2_000_000)
+        first_snapshot = backend.exchange_process_data(timeout_us)
+        slaves = backend.request_state(None, EtherCatState.OP, 2_000_000)
+        return period_ms / 1000.0, timeout_us, max_consecutive_errors, slaves, first_snapshot
 
     @staticmethod
-    def _disable_cycle(backend: EtherCatBackend) -> None:
-        return None
+    def _disable_cycle(backend: EtherCatBackend) -> object:
+        return backend.request_state(None, EtherCatState.SAFE_OP, 2_000_000)
 
     def _execute(self, task: _Task) -> None:
         if task.future.cancelled() or self._backend is None:
@@ -110,13 +117,22 @@ class EtherCatWorker:
         try:
             if task.operation == "__start_cycle__":
                 result = self._configure_cycle(self._backend, *task.args, **task.kwargs)
-                self._cycle_period, self._cycle_timeout_us, self._max_consecutive_errors = result
+                (
+                    self._cycle_period,
+                    self._cycle_timeout_us,
+                    self._max_consecutive_errors,
+                    slaves,
+                    first_snapshot,
+                ) = result
+                self._needs_safe_state = True
                 self._next_cycle = time.perf_counter()
-                self._events.put(WorkerEvent("cycle_started", result))
+                self._events.put(WorkerEvent("process_data", first_snapshot))
+                self._events.put(WorkerEvent("cycle_started", slaves))
             elif task.operation == "__stop_cycle__":
                 result = self._disable_cycle(self._backend)
                 self._cycle_period = 0.0
-                self._events.put(WorkerEvent("cycle_stopped", None))
+                self._needs_safe_state = False
+                self._events.put(WorkerEvent("cycle_stopped", result))
             elif callable(task.operation):
                 result = task.operation(self._backend, *task.args, **task.kwargs)
             elif task.operation == "__wake__":
@@ -125,6 +141,14 @@ class EtherCatWorker:
                 result = getattr(self._backend, task.operation)(*task.args, **task.kwargs)
             task.future.set_result(result)
         except BaseException as exc:
+            if task.operation == "__start_cycle__" and self._backend.connected:
+                self._cycle_period = 0.0
+                try:
+                    slaves = self._disable_cycle(self._backend)
+                    self._needs_safe_state = False
+                    self._events.put(WorkerEvent("slaves_changed", slaves))
+                except Exception:
+                    self._needs_safe_state = True
             task.future.set_exception(exc)
             self._events.put(WorkerEvent("error", exc))
 
@@ -135,9 +159,21 @@ class EtherCatWorker:
             self._events.put(WorkerEvent("process_data", snapshot))
             if snapshot.consecutive_errors >= self._max_consecutive_errors:
                 self._cycle_period = 0.0
+                try:
+                    slaves = self._disable_cycle(self._backend)
+                    self._needs_safe_state = False
+                    self._events.put(WorkerEvent("slaves_changed", slaves))
+                except Exception:
+                    pass
                 self._events.put(WorkerEvent("cycle_fault", snapshot))
         except BaseException as exc:
             self._cycle_period = 0.0
+            try:
+                slaves = self._disable_cycle(self._backend)
+                self._needs_safe_state = False
+                self._events.put(WorkerEvent("slaves_changed", slaves))
+            except Exception:
+                pass
             self._events.put(WorkerEvent("cycle_fault", exc))
 
     def _run(self) -> None:
@@ -145,6 +181,17 @@ class EtherCatWorker:
         self._events.put(WorkerEvent("ready", None))
         try:
             while not self._stop.is_set():
+                # A late PDO exchange must never starve stop/control work. Since the
+                # queue is priority ordered, a control task (if present) is always first.
+                try:
+                    control = self._tasks.get_nowait()
+                except queue.Empty:
+                    control = None
+                if control is not None:
+                    if control.priority <= int(Priority.CONTROL):
+                        self._execute(control)
+                        continue
+                    self._tasks.put(control)
                 now = time.perf_counter()
                 if self._cycle_period and now >= self._next_cycle:
                     self._run_cycle()
@@ -162,6 +209,11 @@ class EtherCatWorker:
             self._cycle_period = 0.0
             if self._backend.connected:
                 try:
+                    if self._needs_safe_state:
+                        try:
+                            self._disable_cycle(self._backend)
+                        except Exception as exc:
+                            self._events.put(WorkerEvent("error", exc))
                     self._backend.disconnect()
                 except Exception as exc:
                     self._events.put(WorkerEvent("error", exc))

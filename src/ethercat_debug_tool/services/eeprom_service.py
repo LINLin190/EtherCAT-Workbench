@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,7 +32,6 @@ class EepromComparison:
 
 @dataclass(frozen=True, slots=True)
 class EepromFlashResult:
-    backup: EepromBackup
     bytes_read_back: int
     words_written: int
     comparison: EepromComparison
@@ -106,6 +104,8 @@ class EepromService:
         *,
         progress: ProgressCallback = lambda _: None,
         cancel: CancelCallback = lambda: False,
+        progress_operation: str = "eeprom-read",
+        progress_stage: str = "read",
     ) -> bytes:
         capacity = self.read_capacity(position)
         result = bytearray()
@@ -117,7 +117,11 @@ class EepromService:
             result.extend(chunk)
             progress(
                 OperationProgress(
-                    "eeprom-read", "read", min(byte_offset + 4, capacity), capacity, f"0x{byte_offset:04X}"
+                    progress_operation,
+                    progress_stage,
+                    min(byte_offset + 4, capacity),
+                    capacity,
+                    f"0x{byte_offset:04X}",
                 )
             )
         return bytes(result[:capacity])
@@ -131,32 +135,20 @@ class EepromService:
         progress: ProgressCallback = lambda _: None,
         cancel: CancelCallback = lambda: False,
     ) -> EepromBackup:
-        raw = self.read_full(position, progress=progress, cancel=cancel)
-        parsed = self.parser.parse(raw)
+        raw = self.read_full(
+            position,
+            progress=progress,
+            cancel=cancel,
+            progress_operation="eeprom-backup",
+            progress_stage="backup-read",
+        )
+        sha256 = hashlib.sha256(raw).hexdigest()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         base = directory / f"slave{position}_{slave.identity.product_code:08X}_{stamp}"
         binary_path = base.with_suffix(".bin")
-        metadata_path = base.with_suffix(".json")
         binary_path.write_bytes(raw)
-        metadata = {
-            "created_utc": datetime.now(UTC).isoformat(),
-            "slave": asdict(slave),
-            "size": len(raw),
-            "sha256": parsed.sha256,
-            "sii": {
-                "vendor_id": parsed.vendor_id,
-                "product_code": parsed.product_code,
-                "revision": parsed.revision,
-                "serial_number": parsed.serial_number,
-                "version": parsed.version,
-                "category_count": len(parsed.categories),
-            },
-        }
-        metadata_path.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
-        )
-        return EepromBackup(binary_path, metadata_path, parsed.sha256, len(raw))
+        return EepromBackup(binary_path, sha256, len(raw))
 
     @staticmethod
     def different_words(current: bytes, target: bytes) -> tuple[int, ...]:
@@ -177,32 +169,19 @@ class EepromService:
             device.serial_number,
         ):
             return False
+        if not device.name and not device.type_name:
+            return True
         kinds = {category.kind for category in image.categories}
-        required = {0x000A, 0x001E}
-        if device.fmmu:
-            required.add(0x0028)
-        if device.sync_managers:
-            required.add(0x0029)
-        if device.tx_pdos:
-            required.add(0x0032)
-        if device.rx_pdos:
-            required.add(0x0033)
-        if device.dc_modes:
-            required.add(0x003C)
-        expected_names = {
-            device.name,
-            device.type_name,
-            *(pdo.name for pdo in (*device.tx_pdos, *device.rx_pdos)),
-        }
-        return required <= kinds and all(not name or name in image.strings for name in expected_names)
+        expected_names = {device.name, device.type_name}
+        return {0x000A, 0x001E} <= kinds and all(
+            not name or name in image.strings for name in expected_names
+        )
 
     def flash(
         self,
         position: int,
         target: bytes,
         device: EsiDevice,
-        backup_dir: Path,
-        slave: SlaveInfo,
         *,
         auto_reset: bool = True,
         progress: ProgressCallback = lambda _: None,
@@ -211,11 +190,19 @@ class EepromService:
         self.parser.parse(target)
         if len(target) != self.read_capacity(position):
             raise ValueError("Target image size does not match the physical EEPROM capacity")
-        # A complete valid backup is mandatory and happens before the first write.
-        backup = self.backup(position, backup_dir, slave, progress=progress, cancel=cancel)
-        current = backup.binary_path.read_bytes()
+        # Read the complete current image to calculate changed words. This is not
+        # persisted; users can create a BIN explicitly with the separate backup action.
+        current = self.read_full(
+            position,
+            progress=progress,
+            cancel=cancel,
+            progress_operation="eeprom-flash",
+            progress_stage="read-current",
+        )
         words = self.different_words(current, target)
         total = len(words)
+        if total == 0:
+            progress(OperationProgress("eeprom-flash", "write-verify", 1, 1, "无需写入差异 Word"))
         for completed, word in enumerate(words, 1):
             self._check_cancel(cancel)
             expected = target[word * 2 : word * 2 + 2]
@@ -233,7 +220,14 @@ class EepromService:
             )
         )
         self.sleep(self.stability_wait_s)
-        readback = self.read_full(position, progress=progress, cancel=lambda: False)
+        progress(OperationProgress("eeprom-flash", "stability-wait", 1, 1, "EEPROM 已稳定"))
+        readback = self.read_full(
+            position,
+            progress=progress,
+            cancel=lambda: False,
+            progress_operation="eeprom-flash",
+            progress_stage="full-verify",
+        )
         comparison = compare_images(target, readback)
         readback_parsed = self.parser.parse(readback)
         semantic_valid = self.semantic_matches(readback_parsed, device)
@@ -247,6 +241,7 @@ class EepromService:
         reload_verified: bool | None = None
         if comparison.equal and semantic_valid and auto_reset:
             # The three calls below are adjacent inside this exclusive Worker operation.
+            progress(OperationProgress("eeprom-flash", "reset", 0, 1, "发送 ESC 复位序列"))
             reset = ResetService(self.backend).reset_ecat(position)
             # A temporary drop after reset is expected and never rewrites the image result.
             self.sleep(self.rediscovery_wait_s)
@@ -254,9 +249,24 @@ class EepromService:
                 rediscovered = any(item.position == position for item in self.backend.scan())
             except Exception:
                 rediscovered = False
+            progress(
+                OperationProgress(
+                    "eeprom-flash",
+                    "reset",
+                    1,
+                    1,
+                    "已重新发现从站" if rediscovered else "复位后未重新发现从站",
+                )
+            )
             if rediscovered:
                 try:
-                    reload = self.read_full(position, progress=progress, cancel=lambda: False)
+                    reload = self.read_full(
+                        position,
+                        progress=progress,
+                        cancel=lambda: False,
+                        progress_operation="eeprom-flash",
+                        progress_stage="reload-verify",
+                    )
                     reload_image = self.parser.parse(reload)
                     reload_verified = compare_images(target, reload).equal and self.semantic_matches(
                         reload_image, device
@@ -264,7 +274,6 @@ class EepromService:
                 except Exception:
                     reload_verified = False
         return EepromFlashResult(
-            backup,
             len(readback),
             total,
             comparison,
@@ -276,12 +285,10 @@ class EepromService:
             reload_verified,
         )
 
-    def restore(
-        self, position: int, backup_path: Path, backup_dir: Path, slave: SlaveInfo, **kwargs: object
-    ) -> EepromFlashResult:
+    def restore(self, position: int, backup_path: Path, **kwargs: object) -> EepromFlashResult:
         raw = backup_path.read_bytes()
         parsed = self.parser.parse(raw)
-        # Restores still make a fresh mandatory backup. Semantic target uses current backup identity.
+        # Semantic target uses the selected BIN identity.
         synthetic = EsiDevice(
             0,
             "",
@@ -307,4 +314,4 @@ class EepromService:
             0,
             0,
         )
-        return self.flash(position, raw, synthetic, backup_dir, slave, **kwargs)  # type: ignore[arg-type]
+        return self.flash(position, raw, synthetic, **kwargs)  # type: ignore[arg-type]

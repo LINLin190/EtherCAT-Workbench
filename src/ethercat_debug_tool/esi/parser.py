@@ -74,6 +74,8 @@ class EsiDcMode:
     shift_time_sync0: int
     cycle_time_sync1: int
     shift_time_sync1: int
+    cycle_factor_sync0: int = 1
+    cycle_factor_sync1: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,12 +268,16 @@ class EsiParser:
 
     @staticmethod
     def _parse_sm(element: ET.Element) -> EsiSyncManager:
+        # SSC-generated ESI files spell the mailbox kinds as MBoxOut/MBoxIn;
+        # canonicalise to the lowercase forms used across the SII generator.
+        aliases = {"mboxout": "mailboxout", "mboxin": "mailboxin"}
+        kind = _text(element)
         return EsiSyncManager(
             parse_number(element.attrib.get("StartAddress")),
             parse_number(element.attrib.get("DefaultSize"), default=0),
             parse_number(element.attrib.get("ControlByte")),
             element.attrib.get("Enable", "0") not in {"0", "false", "False"},
-            _text(element),
+            aliases.get(kind.lower(), kind.lower()),
         )
 
     @staticmethod
@@ -321,6 +327,11 @@ class EsiParser:
             return ()
         result = []
         for mode in _children(dc, "OpMode"):
+
+            def factor(name: str, mode: ET.Element = mode) -> int:
+                node = _child(mode, name)
+                return parse_number(node.attrib.get("Factor"), default=1) if node is not None else 1
+
             result.append(
                 EsiDcMode(
                     _text(_child(mode, "Name")),
@@ -330,6 +341,8 @@ class EsiParser:
                     parse_number(_text(_child(mode, "ShiftTimeSync0")), default=0),
                     parse_number(_text(_child(mode, "CycleTimeSync1")), default=0),
                     parse_number(_text(_child(mode, "ShiftTimeSync1")), default=0),
+                    factor("CycleTimeSync0"),
+                    factor("CycleTimeSync1"),
                 )
             )
         return tuple(result)

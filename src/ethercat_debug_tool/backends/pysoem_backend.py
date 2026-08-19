@@ -24,13 +24,25 @@ def _decode_adapter_description(value: object) -> str:
     return str(value)
 
 
-def _chip_from_register(raw: bytes) -> tuple[str, str]:
+def _chip_from_register(
+    raw: bytes,
+    *,
+    fmmu_count: int | None = None,
+    sm_count: int | None = None,
+    ram_kib: int | None = None,
+) -> tuple[str, str]:
     text = raw.rstrip(b"\x00").decode("ascii", errors="ignore").upper()
     value = int.from_bytes(raw, "little")
     candidates = {"E101": "ET1100_COMPATIBLE", "E252": "LAN9252_COMPATIBLE", "E253": "LAN9253_COMPATIBLE"}
     for model, family in candidates.items():
         if model in text or value == int(model, 16):
             return model, family
+    # LAN9252 exposes 3 FMMUs, 4 SyncManagers and 4 KiB DPRAM. This
+    # capability signature is used only for the original Microchip part;
+    # domestic compatible models remain identifiable solely by model text
+    # or their explicit chip register value above.
+    if (fmmu_count, sm_count, ram_kib) == (3, 4, 4):
+        return "LAN9252", "LAN9252_COMPATIBLE"
     return "Generic ESC", "GENERIC"
 
 
@@ -134,10 +146,24 @@ class PysoemBackend:
             configured_address = int.from_bytes(slave._fprd(0x0010, 2, 4000), "little")
         except Exception:
             pass
+        chip_raw = b""
         try:
-            chip_model, family = _chip_from_register(slave._fprd(0x0E00, 4, 4000))
+            chip_raw = slave._fprd(0x0E00, 4, 4000)
         except Exception:
+            # Some ESCs reject reads in the 0x0E00 area; the capability
+            # signature below still identifies original vendor chips.
             pass
+        try:
+            capabilities = slave._fprd(0x0004, 3, 4000)
+        except Exception:
+            capabilities = None
+        if capabilities is not None or chip_raw:
+            chip_model, family = _chip_from_register(
+                chip_raw,
+                fmmu_count=capabilities[0] if capabilities is not None else None,
+                sm_count=capabilities[1] if capabilities is not None else None,
+                ram_kib=capabilities[2] if capabilities is not None else None,
+            )
         try:
             state = EtherCatState(int(slave.state) & 0x0F)
         except ValueError:
