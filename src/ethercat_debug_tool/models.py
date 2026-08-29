@@ -10,6 +10,15 @@ class BackendMode(StrEnum):
     REAL = "real"
 
 
+class MasterPhase(StrEnum):
+    DISCONNECTED = "disconnected"
+    ADAPTER_OPEN = "adapter_open"
+    BUS_SCANNED = "bus_scanned"
+    PDO_CONFIGURED = "pdo_configured"
+    CYCLIC = "cyclic"
+    FAULTED = "faulted"
+
+
 class EtherCatState(IntEnum):
     NONE = 0x00
     INIT = 0x01
@@ -54,6 +63,19 @@ class SlaveInfo:
     configured_address: int | None = None
     chip_model: str = "Generic ESC"
     register_family: str = "GENERIC"
+
+
+@dataclass(frozen=True, slots=True)
+class MasterSnapshot:
+    mode: BackendMode
+    phase: MasterPhase
+    adapter: str | None
+    connected: bool
+    cycle_running: bool
+    slaves: tuple[SlaveInfo, ...]
+    session_id: int
+    revision: int
+    last_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +136,7 @@ class OperationProgress:
     completed: int
     total: int
     detail: str = ""
+    cancellable: bool = True
 
 
 @dataclass(frozen=True, slots=True)

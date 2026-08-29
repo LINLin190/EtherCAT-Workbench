@@ -27,7 +27,7 @@ Issues = "https://github.com/LINLin190/EtherCAT-Workbench/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ethercat_debug_tool = ["esc_profiles/data/*.json"]
+ethercat_debug_tool = ["esc_profiles/data/*.json", "protocol/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

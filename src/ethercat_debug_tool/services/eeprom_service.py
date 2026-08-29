@@ -71,14 +71,31 @@ class EepromService:
         backend: EtherCatBackend,
         *,
         stability_wait_s: float = 10.0,
-        rediscovery_wait_s: float = 1.0,
+        rediscovery_timeout_s: float = 5.0,
+        rediscovery_poll_s: float = 0.25,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.backend = backend
         self.stability_wait_s = stability_wait_s
-        self.rediscovery_wait_s = rediscovery_wait_s
+        self.rediscovery_timeout_s = max(0.0, rediscovery_timeout_s)
+        self.rediscovery_poll_s = max(0.01, rediscovery_poll_s)
         self.sleep = sleep
+        self.monotonic = monotonic
         self.parser = SiiParser()
+
+    def _rediscover(self, position: int) -> bool:
+        deadline = self.monotonic() + self.rediscovery_timeout_s
+        while True:
+            try:
+                if any(item.position == position for item in self.backend.scan()):
+                    return True
+            except Exception:
+                pass
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                return False
+            self.sleep(min(self.rediscovery_poll_s, remaining))
 
     @staticmethod
     def _check_cancel(cancel: CancelCallback) -> None:
@@ -106,6 +123,7 @@ class EepromService:
         cancel: CancelCallback = lambda: False,
         progress_operation: str = "eeprom-read",
         progress_stage: str = "read",
+        cancellable: bool = True,
     ) -> bytes:
         capacity = self.read_capacity(position)
         result = bytearray()
@@ -122,6 +140,7 @@ class EepromService:
                     min(byte_offset + 4, capacity),
                     capacity,
                     f"0x{byte_offset:04X}",
+                    cancellable,
                 )
             )
         return bytes(result[:capacity])
@@ -201,32 +220,67 @@ class EepromService:
         )
         words = self.different_words(current, target)
         total = len(words)
+        # Cancellation is safe until programming starts. Once the first word is
+        # written, finish programming and verification so the ESC is not left
+        # with an arbitrarily partial SII image.
+        self._check_cancel(cancel)
         if total == 0:
-            progress(OperationProgress("eeprom-flash", "write-verify", 1, 1, "无需写入差异 Word"))
+            progress(
+                OperationProgress(
+                    "eeprom-flash", "write-verify", 1, 1, "无需写入差异 Word", cancellable=False
+                )
+            )
+        else:
+            progress(
+                OperationProgress(
+                    "eeprom-flash",
+                    "write-verify",
+                    0,
+                    total,
+                    "已进入不可中断的写入与校验阶段",
+                    cancellable=False,
+                )
+            )
         for completed, word in enumerate(words, 1):
-            self._check_cancel(cancel)
             expected = target[word * 2 : word * 2 + 2]
             self.backend.eeprom_write(position, word, expected)
             if self.backend.eeprom_read(position, word)[:2] != expected:
                 raise RuntimeError(f"EEPROM batch verification failed at word 0x{word:04X}")
             progress(
-                OperationProgress("eeprom-flash", "write-verify", completed, total, f"word 0x{word:04X}")
+                OperationProgress(
+                    "eeprom-flash",
+                    "write-verify",
+                    completed,
+                    total,
+                    f"word 0x{word:04X}",
+                    cancellable=False,
+                )
             )
 
         # This wait is intentionally not cancellable: it is a mandatory stability stage.
         progress(
             OperationProgress(
-                "eeprom-flash", "stability-wait", 0, 1, f"mandatory {self.stability_wait_s:g} second wait"
+                "eeprom-flash",
+                "stability-wait",
+                0,
+                1,
+                f"mandatory {self.stability_wait_s:g} second wait",
+                cancellable=False,
             )
         )
         self.sleep(self.stability_wait_s)
-        progress(OperationProgress("eeprom-flash", "stability-wait", 1, 1, "EEPROM 已稳定"))
+        progress(
+            OperationProgress(
+                "eeprom-flash", "stability-wait", 1, 1, "EEPROM 已稳定", cancellable=False
+            )
+        )
         readback = self.read_full(
             position,
             progress=progress,
             cancel=lambda: False,
             progress_operation="eeprom-flash",
             progress_stage="full-verify",
+            cancellable=False,
         )
         comparison = compare_images(target, readback)
         readback_parsed = self.parser.parse(readback)
@@ -241,14 +295,14 @@ class EepromService:
         reload_verified: bool | None = None
         if comparison.equal and semantic_valid and auto_reset:
             # The three calls below are adjacent inside this exclusive Worker operation.
-            progress(OperationProgress("eeprom-flash", "reset", 0, 1, "发送 ESC 复位序列"))
+            progress(
+                OperationProgress(
+                    "eeprom-flash", "reset", 0, 1, "发送 ESC 复位序列", cancellable=False
+                )
+            )
             reset = ResetService(self.backend).reset_ecat(position)
             # A temporary drop after reset is expected and never rewrites the image result.
-            self.sleep(self.rediscovery_wait_s)
-            try:
-                rediscovered = any(item.position == position for item in self.backend.scan())
-            except Exception:
-                rediscovered = False
+            rediscovered = self._rediscover(position)
             progress(
                 OperationProgress(
                     "eeprom-flash",
@@ -256,6 +310,7 @@ class EepromService:
                     1,
                     1,
                     "已重新发现从站" if rediscovered else "复位后未重新发现从站",
+                    cancellable=False,
                 )
             )
             if rediscovered:
@@ -266,6 +321,7 @@ class EepromService:
                         cancel=lambda: False,
                         progress_operation="eeprom-flash",
                         progress_stage="reload-verify",
+                        cancellable=False,
                     )
                     reload_image = self.parser.parse(reload)
                     reload_verified = compare_images(target, reload).equal and self.semantic_matches(

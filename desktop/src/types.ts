@@ -1,4 +1,5 @@
 export type Mode = "real" | "demo";
+export type MasterPhase = "disconnected" | "adapter_open" | "bus_scanned" | "pdo_configured" | "cyclic" | "faulted";
 
 export interface AdapterInfo {
   name: string;
@@ -27,10 +28,19 @@ export interface SlaveInfo {
 }
 
 export interface WorkbenchStatus {
+  host_generation: number;
   mode: Mode;
+  phase: MasterPhase;
+  adapter?: string | null;
   connected: boolean;
   cycle_running: boolean;
   slaves: SlaveInfo[];
+  worker_healthy?: boolean;
+  worker_state?: string;
+  queue_depth?: number;
+  session_id: number;
+  revision: number;
+  last_error?: string | null;
 }
 
 export interface AutoScanAttempt {
@@ -51,6 +61,19 @@ export interface AutoScanResult {
 export interface BridgeEvent<T = unknown> {
   kind: string;
   data: T;
+  host_generation?: number;
+  session_id?: number;
+}
+
+export interface BridgeExitInfo {
+  message: string;
+  reason: string;
+  exit_code?: number;
+  stderr_tail?: string;
+  log_path?: string;
+  last_request_id?: number;
+  last_method?: string;
+  host_generation?: number;
 }
 
 export interface PdoEntry {
@@ -65,14 +88,37 @@ export interface PdoEntry {
 }
 
 export interface RegisterDefinition {
+  definition_id?: string;
+  profile?: string;
+  source_chip?: string;
   address: number;
+  address_text?: string;
+  address_space?: string;
+  address_space_label?: string;
   size?: number;
   width?: number;
+  width_bits?: number;
   name: string;
   group: string;
   access: string;
+  master_access?: string;
+  master_access_allowed?: boolean;
+  direct_read_allowed?: boolean;
+  direct_write_allowed?: boolean;
+  dangerous?: boolean;
   description: string;
-  bit_fields?: { name: string; shift: number; bits: number }[];
+  reset_value?: string;
+  power_on_default?: string;
+  state_restriction?: string;
+  hardware_condition?: string;
+  reserved_bits_rule?: string;
+  byte_order?: string;
+  read_side_effects?: string[];
+  write_side_effects?: string[];
+  write_sequence?: string;
+  confidence?: string;
+  fields?: { bits: string; name: string; ecat_access?: string; access?: string; reserved?: boolean; description?: string; reset_value?: string }[];
+  bit_fields?: { name: string; shift: number; bits: number; access?: string; reserved?: boolean; description?: string }[];
 }
 
 export interface OperationProgress {
@@ -81,6 +127,7 @@ export interface OperationProgress {
   completed: number;
   total: number;
   detail: string;
+  cancellable?: boolean;
 }
 
 export interface EsiDevice {

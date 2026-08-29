@@ -72,6 +72,26 @@ if ($Check) {
     exit 0
 }
 
+# A previous interrupted Tauri/Vite run can leave the dev server listening on
+# the configured port. Reclaim only a matching project-owned Vite process;
+# never terminate an unrelated service that happens to use the same port.
+$devPort = 1420
+$projectPath = [System.IO.Path]::GetFullPath($desktopRoot).TrimEnd('\')
+$listeners = @(Get-NetTCPConnection -LocalPort $devPort -State Listen -ErrorAction SilentlyContinue)
+foreach ($listener in $listeners) {
+    $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+    $commandLine = [string]$processInfo.CommandLine
+    $isProjectVite = $processInfo.Name -eq 'node.exe' -and
+        $commandLine.IndexOf($projectPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $commandLine -match '(?i)(vite|node_modules)'
+    if ($isProjectVite) {
+        Write-Host "清理上次残留的 Vite 开发服务器（PID $($listener.OwningProcess)）。" -ForegroundColor DarkGray
+        Stop-Process -Id $listener.OwningProcess -Force -ErrorAction Stop
+    } else {
+        throw "端口 $devPort 已被其他进程占用（PID $($listener.OwningProcess)）。请先停止该服务后重试。"
+    }
+}
+
 Push-Location $desktopRoot
 try {
     if (-not (Test-Path 'node_modules')) {

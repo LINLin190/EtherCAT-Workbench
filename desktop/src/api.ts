@@ -1,9 +1,53 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AdapterInfo, AutoScanResult, BridgeEvent, EsiDevice, Mode, SlaveInfo, WorkbenchStatus } from "./types";
+import type { AdapterInfo, AutoScanResult, BridgeEvent, BridgeExitInfo, EsiDevice, Mode, RegisterDefinition, SlaveInfo, WorkbenchStatus } from "./types";
+import { normalizeBridgeFailure, operationStore } from "./operationStore";
+import { acceptsSessionEvent, acceptsSnapshot } from "./snapshotClock";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 type Handler = (event: BridgeEvent) => void;
+type SnapshotHandler = (snapshot: WorkbenchStatus) => void;
+interface BridgeEnvelope<T> {
+  result: T;
+  host_generation: number;
+  session_id: number;
+  snapshot: WorkbenchStatus;
+}
+
+const snapshotHandlers = new Set<SnapshotHandler>();
+let latestSnapshot: WorkbenchStatus | undefined;
+
+function publishSnapshot(snapshot: WorkbenchStatus | undefined, sourceOperationId?: string) {
+  if (!snapshot) return;
+  if (!acceptsSnapshot(latestSnapshot, snapshot)) return;
+  latestSnapshot = snapshot;
+  operationStore.setSnapshotClock(snapshot.host_generation, snapshot.session_id, sourceOperationId);
+  snapshotHandlers.forEach((handler) => handler(snapshot));
+}
+
+function publishHostFault(message: string, hostGeneration?: number) {
+  const previous = latestSnapshot;
+  publishSnapshot({
+    host_generation: hostGeneration ?? previous?.host_generation ?? 0,
+    mode: previous?.mode ?? "real",
+    phase: "faulted",
+    adapter: null,
+    connected: false,
+    cycle_running: false,
+    slaves: [],
+    session_id: previous?.session_id ?? 0,
+    revision: previous?.revision ?? 0,
+    last_error: message,
+    worker_healthy: false,
+    worker_state: "exited",
+    queue_depth: 0,
+  });
+}
+
+export function subscribeBusSnapshot(handler: SnapshotHandler): () => void {
+  snapshotHandlers.add(handler);
+  return () => snapshotHandlers.delete(handler);
+}
 
 const demoSlaves: SlaveInfo[] = [
   {
@@ -44,24 +88,90 @@ const demoSlaves: SlaveInfo[] = [
   },
 ];
 
+const previewRegisterDefinitions: RegisterDefinition[] = [
+  {
+    definition_id: "preview-esc-type", profile: "ET1100", source_chip: "ET1100",
+    address: 0x0000, address_text: "0x0000", address_space: "esc_core", address_space_label: "ESC Core",
+    size: 1, width: 1, name: "Type", group: "标识", access: "RO", master_access: "RO",
+    master_access_allowed: true, direct_read_allowed: true, direct_write_allowed: false,
+    description: "ESC 类型", confidence: "Demo",
+  },
+  {
+    definition_id: "preview-al-status", profile: "ET1100", source_chip: "ET1100",
+    address: 0x0130, address_text: "0x0130", address_space: "esc_core", address_space_label: "ESC Core",
+    size: 2, width: 2, name: "AL Status", group: "状态机", access: "RO", master_access: "RO",
+    master_access_allowed: true, direct_read_allowed: true, direct_write_allowed: false,
+    description: "当前 EtherCAT AL 状态", confidence: "Demo",
+  },
+  {
+    definition_id: "preview-al-status-code", profile: "ET1100", source_chip: "ET1100",
+    address: 0x0134, address_text: "0x0134", address_space: "esc_core", address_space_label: "ESC Core",
+    size: 2, width: 2, name: "AL Status Code", group: "状态机", access: "RO", master_access: "RO",
+    master_access_allowed: true, direct_read_allowed: true, direct_write_allowed: false,
+    description: "最近一次 AL 错误码", confidence: "Demo",
+  },
+  {
+    definition_id: "preview-invalid-frame-counter", profile: "ET1100", source_chip: "ET1100",
+    address: 0x0300, address_text: "0x0300", address_space: "esc_core", address_space_label: "ESC Core",
+    size: 8, width: 8, name: "Invalid Frame Counter", group: "链路诊断", access: "RO", master_access: "RO",
+    master_access_allowed: true, direct_read_allowed: true, direct_write_allowed: false,
+    description: "各端口无效帧计数", confidence: "Demo",
+  },
+];
+
 class PreviewBridge {
+  hostGeneration = 1;
   mode: Mode = "demo";
   connected = true;
   running = false;
   scanned: SlaveInfo[] = structuredClone(demoSlaves);
   handlers = new Set<Handler>();
+  sessionId = 0;
+  revision = 0;
+  adapter = "preview0";
+
+  advanceSession() {
+    this.sessionId += 1;
+    this.revision += 1;
+  }
+
+  snapshot(): WorkbenchStatus {
+    return {
+      host_generation: this.hostGeneration,
+      mode: this.mode,
+      phase: this.running ? "cyclic" : this.connected ? this.scanned.length ? "bus_scanned" : "adapter_open" : "disconnected",
+      adapter: this.connected ? this.adapter : undefined,
+      connected: this.connected,
+      cycle_running: this.running,
+      slaves: structuredClone(this.scanned),
+      session_id: this.sessionId,
+      revision: this.revision,
+      worker_healthy: true,
+      worker_state: "ready",
+      queue_depth: 0,
+    };
+  }
 
   emit(kind: string, data: unknown) {
-    this.handlers.forEach((handler) => handler({ kind, data }));
+    this.handlers.forEach((handler) => handler({
+      kind,
+      data,
+      host_generation: this.hostGeneration,
+      session_id: this.sessionId,
+    }));
   }
 
   async request<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     await new Promise((resolve) => setTimeout(resolve, method === "scan" || method === "auto_scan" ? 450 : 120));
     switch (method) {
       case "status":
-        return { mode: this.mode, connected: this.connected, cycle_running: this.running, slaves: this.scanned } as T;
+        return this.snapshot() as T;
       case "switch_mode":
         this.mode = String(params.mode) as Mode;
+        this.connected = false;
+        this.running = false;
+        this.scanned = [];
+        this.advanceSession();
         return { mode: this.mode } as T;
       case "enumerate_adapters":
         return [{ name: "preview0", description: "Intel(R) Ethernet Controller I225-V" }] as T;
@@ -69,6 +179,7 @@ class PreviewBridge {
         const adapters = [{ name: "preview0", description: "Intel(R) Ethernet Controller I225-V" }];
         this.connected = true;
         this.scanned = structuredClone(demoSlaves);
+        this.advanceSession();
         return {
           adapters,
           selected_adapter: "preview0",
@@ -79,15 +190,18 @@ class PreviewBridge {
       }
       case "connect":
         this.connected = true;
+        this.scanned = [];
+        this.advanceSession();
         return { connected: true } as T;
       case "disconnect":
         this.connected = false;
         this.running = false;
         this.scanned = [];
+        this.advanceSession();
         return { connected: false } as T;
       case "scan":
         this.scanned = structuredClone(demoSlaves);
-        this.emit("slaves_changed", this.scanned);
+        this.advanceSession();
         return this.scanned as T;
       case "read_states":
         return this.scanned as T;
@@ -117,7 +231,9 @@ class PreviewBridge {
         } as T;
       case "start_cycle":
         this.running = true;
-        this.emit("cycle_started", this.scanned.map((slave) => ({ ...slave, state: 8 })));
+        this.scanned = this.scanned.map((slave) => ({ ...slave, state: 8 }));
+        this.revision += 1;
+        this.emit("cycle_started", this.scanned);
         window.setTimeout(() => this.emit("process_data", {
           inputs: ["34 12", "", "08 00 00 00"], outputs: ["", "01", "0F 00 00 00"],
           actual_wkc: 6, expected_wkc: 6, cycle_count: 18420, timeout_count: 0,
@@ -126,17 +242,21 @@ class PreviewBridge {
         return { running: true } as T;
       case "stop_cycle":
         this.running = false;
-        this.emit("cycle_stopped", this.scanned.map((slave) => ({ ...slave, state: 4 })));
+        this.scanned = this.scanned.map((slave) => ({ ...slave, state: 4 }));
+        this.revision += 1;
+        this.emit("cycle_stopped", this.scanned);
         return { running: false, slaves: this.scanned } as T;
       case "set_output":
         return { applied: true, data: params.data } as T;
       case "register_catalog":
-        return [
-          { address: 0x0000, size: 1, name: "Type", group: "标识", access: "RO", description: "ESC 类型" },
-          { address: 0x0130, size: 2, name: "AL Status", group: "状态机", access: "RO", description: "当前 EtherCAT AL 状态" },
-          { address: 0x0134, size: 2, name: "AL Status Code", group: "状态机", access: "RO", description: "最近一次 AL 错误码" },
-          { address: 0x0300, size: 8, name: "Invalid Frame Counter", group: "链路诊断", access: "RO", description: "各端口无效帧计数" },
-        ] as T;
+        return structuredClone(previewRegisterDefinitions) as T;
+      case "register_definition": {
+        const definition = previewRegisterDefinitions.find(
+          (item) => item.definition_id === String(params.definition_id ?? ""),
+        );
+        if (!definition) throw new Error("预览寄存器定义不存在");
+        return structuredClone(definition) as T;
+      }
       case "register_read":
         return { position: params.position, address: params.address, data: "08 00", wkc: 1, duration_ms: 0.38, timestamp: Date.now() / 1000 } as T;
       case "register_watch": {
@@ -144,7 +264,7 @@ class PreviewBridge {
         return requests.map((request) => ({
           position: params.position,
           address: request.address,
-          data: Number(request.length ?? 2) === 1 ? "08" : "08 00",
+          data: Number(request.size ?? 2) === 1 ? "08" : "08 00",
           wkc: 1,
           duration_ms: 0.31,
           timestamp: Date.now() / 1000,
@@ -154,17 +274,20 @@ class PreviewBridge {
         return {
           plan_id: "preview-register-plan",
           plan: { current: "00 00", target: params.data, changed_mask: "FF FF" },
+          expires_in_seconds: 60,
         } as T;
       case "register_execute_write":
         return { fpwr_wkc: 1, readback: "01 00", verified: true, conclusion: "写入后回读一致" } as T;
       case "register_reset":
+        this.scanned = [];
+        this.advanceSession();
         return { reset_sequence: [true, true, true] } as T;
       case "esi_load": {
         const device: EsiDevice = { name: "Demo EtherCAT Device", type_name: "Demo-IO", product_code: 0x12345678, revision_number: 0x00010000, serial_number: 0, eeprom_byte_size: 2048 };
         return { document_id: "preview-document", path: params.path, sha256: "preview", vendor_id: 2, vendor_name: "Demo Automation", devices: [device] } as T;
       }
       case "sii_generate":
-        return { target_id: "preview-target", size: 2048, sha256: "9f3b…d120", supported: ["Identity", "Strings", "PDO", "FMMU", "SyncM"], omitted: ["Vendor category 0x9000"], device: { name: "Demo EtherCAT Device", product_code: 0x12345678, revision_number: 0x10000 } } as T;
+        return { target_id: "preview-target", size: 2048, sha256: "9f3b…d120", supported: ["Identity", "Strings", "PDO", "FMMU", "SyncM"], omitted: ["Vendor category 0x9000"], layout: [{ name: "Fixed SII area", offset: 0, length: 128, content: "00 00 00 00" }, { kind: 0x000A, name: "Strings", offset: 128, length: 42, content: "02 0B 44 65 6D 6F" }, { kind: 0xFFFF, name: "End marker", offset: 512, length: 2, content: "FF FF" }], device: { name: "Demo EtherCAT Device", product_code: 0x12345678, revision_number: 0x10000 } } as T;
       case "eeprom_read":
         return {
           data: "FF ".repeat(2048).trim(),
@@ -190,8 +313,9 @@ class PreviewBridge {
       case "eeprom_flash":
       case "eeprom_restore":
         for (const completed of [10, 35, 68, 100]) {
-          this.emit("progress", { operation: "flash", stage: completed < 100 ? "写入 EEPROM" : "校验完成", completed, total: 100, detail: `${completed}%` });
+          this.emit("progress", { operation: "eeprom-flash", stage: completed < 100 ? "write-verify" : "full-verify", completed, total: 100, detail: `${completed}%`, cancellable: false });
         }
+        this.advanceSession();
         return {
           success: true,
           result: {
@@ -222,9 +346,45 @@ class PreviewBridge {
 
 const preview = new PreviewBridge();
 
+export class BridgeRequestError extends Error {
+  readonly code: string;
+  readonly failure: ReturnType<typeof normalizeBridgeFailure>;
+
+  constructor(failure: ReturnType<typeof normalizeBridgeFailure>) {
+    super(failure.message);
+    this.name = "BridgeRequestError";
+    this.code = failure.code;
+    this.failure = failure;
+  }
+}
+
 export async function bridgeRequest<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-  if (!isTauri) return preview.request<T>(method, params);
-  return invoke<T>("bridge_request", { method, params });
+  const operation = operationStore.begin(method);
+  operationStore.transition(operation.id, "running");
+  try {
+    if (!isTauri) {
+      const value = await preview.request<T>(method, params);
+      publishSnapshot(preview.snapshot(), operation.id);
+      const current = operationStore.get(operation.id);
+      if (current?.phase !== "running") throw current?.error ?? new Error("操作上下文已失效");
+      operationStore.transition(operation.id, "completed");
+      return value;
+    }
+    const envelope = await invoke<BridgeEnvelope<T>>("bridge_request", { method, params, sessionId: operation.sessionId });
+    publishSnapshot(envelope.snapshot, operation.id);
+    const current = operationStore.get(operation.id);
+    if (current?.phase !== "running") throw current?.error ?? new Error("操作上下文已失效");
+    operationStore.transition(operation.id, "completed");
+    return envelope.result;
+  } catch (error) {
+    if (error && typeof error === "object" && "snapshot" in error) {
+      publishSnapshot((error as { snapshot?: WorkbenchStatus }).snapshot, operation.id);
+    }
+    const failure = normalizeBridgeFailure(error);
+    operationStore.transition(operation.id, failure.operation_result === "unknown" ? "unknown" : failure.code === "CANCELLED" ? "cancelled" : "failed", failure);
+    if (failure.session_invalidated) operationStore.invalidate(failure.code, failure.message);
+    throw new BridgeRequestError(failure);
+  }
 }
 
 export async function onBridgeEvent(handler: Handler): Promise<UnlistenFn> {
@@ -232,7 +392,48 @@ export async function onBridgeEvent(handler: Handler): Promise<UnlistenFn> {
     preview.handlers.add(handler);
     return () => preview.handlers.delete(handler);
   }
-  return listen<BridgeEvent>("bridge-event", (event) => handler(event.payload));
+  const bridgeEvent = await listen<BridgeEvent>("bridge-event", (event) => {
+    if (event.payload.kind === "bus_snapshot") {
+      const snapshot = event.payload.data as WorkbenchStatus;
+      publishSnapshot({
+        ...snapshot,
+        host_generation: snapshot.host_generation ?? event.payload.host_generation ?? 0,
+      });
+      return;
+    }
+    if (!acceptsSessionEvent(latestSnapshot, event.payload)) return;
+    handler(event.payload);
+  });
+  const restarted = await listen<{ host_generation: number }>("bridge-restarted", (event) =>
+    handler({ kind: "host_ready", data: event.payload })
+  );
+  const restartFailed = await listen<{ host_generation: number; message: string }>("bridge-restart-failed", (event) =>
+    handler({ kind: "host_restart_failed", data: event.payload })
+  );
+  return () => { bridgeEvent(); restarted(); restartFailed(); };
+}
+
+export async function onBridgeExited(handler: (info: BridgeExitInfo) => void): Promise<UnlistenFn> {
+  if (!isTauri) return () => undefined;
+  const receive = (payload: BridgeExitInfo | string) => {
+    const info = typeof payload === "string"
+      ? { message: payload, reason: "旧版桥接未提供退出详情" }
+      : payload;
+    operationStore.invalidate("PROCESS_EXITED", info.message);
+    publishHostFault(info.message, info.host_generation);
+    handler(info);
+  };
+  const exited = await listen<BridgeExitInfo | string>("bridge-exited", (event) => receive(event.payload));
+  const stalled = await listen<{ message: string }>("bridge-stalled", (event) => receive({ ...event.payload, reason: "heartbeat_timeout" }));
+  return () => { exited(); stalled(); };
+}
+
+export async function onFileDrop(handler: (paths: string[]) => void): Promise<UnlistenFn> {
+  if (!isTauri) return () => undefined;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow().onDragDropEvent((event) => {
+    if (event.payload.type === "drop") handler(event.payload.paths);
+  });
 }
 
 export async function pickFile(extensions: string[]): Promise<string | null> {

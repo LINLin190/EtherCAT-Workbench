@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import {
   Accordion,
   AccordionDetails,
@@ -64,10 +64,12 @@ import {
   ExpandMoreRounded,
 } from "@mui/icons-material";
 import packageInfo from "../package.json";
-import { bridgeRequest, onBridgeEvent, openExternal, pickDirectory, pickFile, previewMode, revealPath, type AdapterInfo } from "./api";
+import { alStatusInfo, type AlStatusLanguage } from "./alStatus";
+import { BridgeRequestError, bridgeRequest, onBridgeEvent, onBridgeExited, onFileDrop, openExternal, pickDirectory, pickFile, previewMode, revealPath, subscribeBusSnapshot, type AdapterInfo } from "./api";
+import { operationStore } from "./operationStore";
 import type {
-  AutoScanResult,
   BridgeEvent,
+  BridgeExitInfo,
   EsiDevice,
   OperationProgress,
   PdoEntry,
@@ -80,8 +82,19 @@ import { hex, stateLabel } from "./types";
 type PageKey = "overview" | "registers" | "eeprom";
 type Run = <T>(operation: () => Promise<T>, success?: string) => Promise<T | undefined>;
 const PREFERRED_ADAPTER_KEY = "ethercat-workbench.preferred-adapter";
+const RECENT_ESI_KEY = "ethercat-workbench.recent-esi";
+const AL_LANGUAGE_KEY = "ethercat-workbench.al-language";
 const PROJECT_URL = "https://github.com/LINLin190/EtherCAT-Workbench";
 const ISSUES_URL = `${PROJECT_URL}/issues`;
+
+function orderAdapters(items: AdapterInfo[]): AdapterInfo[] {
+  const virtual = /\b(wan miniport|wi-?fi|wireless|loopback|vmware|virtual|wintun|tunnel)\b/i;
+  const ethernet = /\b(ethernet|gbe|gigabit|i21\d|realtek|ethercat)\b/i;
+  return [...items].sort((left, right) => {
+    const score = (item: AdapterInfo) => virtual.test(item.description) ? 2 : ethernet.test(item.description) ? 0 : 1;
+    return score(left) - score(right) || left.description.localeCompare(right.description);
+  });
+}
 
 interface SlaveContextMenu {
   mouseX: number;
@@ -96,13 +109,61 @@ const pages: { key: PageKey; label: string; icon: ReactNode }[] = [
 ];
 
 const cardSx = { borderRadius: 1.25, minWidth: 0 };
+const registerProfiles = ["ET1100", "LAN9252", "LAN9253"];
+const registerProfileFamily: Record<string, string> = {
+  ET1100: "ET1100_COMPATIBLE", LAN9252: "LAN9252_COMPATIBLE", LAN9253: "LAN9253_COMPATIBLE",
+};
+
+function slaveIdentityKey(slave?: SlaveInfo): string {
+  if (!slave) return "none";
+  const identity = slave.identity;
+  return [slave.position, identity.vendor_id, identity.product_code, identity.revision, identity.serial_number, slave.configured_address ?? ""].join(":");
+}
+
+function isEepromOperation(operation?: string): boolean {
+  return Boolean(operation?.startsWith("eeprom"));
+}
+
+function cycleFaultMessage(data: unknown): string {
+  if (typeof data === "string") return `周期通信故障：${data}`;
+  if (data && typeof data === "object") {
+    const value = data as Partial<Snapshot> & { message?: unknown };
+    if (typeof value.message === "string") return `周期通信故障：${value.message}`;
+    if (typeof value.actual_wkc === "number" || typeof value.expected_wkc === "number") {
+      return `周期通信故障：WKC ${value.actual_wkc ?? "—"}/${value.expected_wkc ?? "—"}，连续错误 ${value.consecutive_errors ?? "—"}，超时 ${value.timeout_count ?? "—"}`;
+    }
+  }
+  return "周期通信发生未知故障，请停止通信并刷新从站状态。";
+}
+
+function defaultRegisterProfile(chipModel: string | undefined): string {
+  if (chipModel === "LAN9252" || chipModel === "E252") return "LAN9252";
+  if (chipModel === "LAN9253" || chipModel === "E253") return "LAN9253";
+  return "ET1100";
+}
+
+const masterPhaseLabels: Record<WorkbenchStatus["phase"], string> = {
+  disconnected: "未连接",
+  adapter_open: "网卡已打开",
+  bus_scanned: "已扫描总线",
+  pdo_configured: "PDO 已配置",
+  cyclic: "周期通信中",
+  faulted: "通信故障",
+};
+
+function profileCompatibilityText(chipModel: string | undefined): string | undefined {
+  if (chipModel === "E252") return "已识别国产 E252；寄存器目录和安全规则完整采用 LAN9252 同构定义。";
+  if (chipModel === "E101") return "已识别国产 E101；寄存器目录和安全规则完整采用 ET1100 同构定义。";
+  if (chipModel === "E253") return "已识别国产 E253；寄存器目录和安全规则完整采用 LAN9253 同构定义。";
+  return undefined;
+}
 
 function PageTitle({ title, subtitle, actions }: { title: string; subtitle: string; actions?: ReactNode }) {
   return (
-    <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2} sx={{ mb: 2 }}>
+    <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2} sx={{ mb: 1.25 }}>
       <Box>
         <Typography variant="h5" fontWeight={750}>{title}</Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.35 }}>{subtitle}</Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.2 }}>{subtitle}</Typography>
       </Box>
       {actions && <Stack direction="row" gap={1}>{actions}</Stack>}
     </Stack>
@@ -112,9 +173,9 @@ function PageTitle({ title, subtitle, actions }: { title: string; subtitle: stri
 function EmptyState({ text }: { text: string }) {
   return (
     <Card sx={cardSx}>
-      <CardContent sx={{ minHeight: 190, display: "grid", placeItems: "center", textAlign: "center" }}>
-        <Stack alignItems="center" spacing={1.2} color="text.secondary">
-          <DeveloperBoardRounded sx={{ fontSize: 44, opacity: 0.45 }} />
+      <CardContent sx={{ minHeight: 156, display: "grid", placeItems: "center", textAlign: "center" }}>
+        <Stack alignItems="center" spacing={0.8} color="text.secondary">
+          <DeveloperBoardRounded sx={{ fontSize: 36, opacity: 0.45 }} />
           <Typography>{text}</Typography>
         </Stack>
       </CardContent>
@@ -127,50 +188,76 @@ function StateChip({ state }: { state: number }) {
   return <Chip size="small" color={color} variant={state === 8 ? "filled" : "outlined"} label={stateLabel(state)} />;
 }
 
-function OverviewPage({ slave, slaves, run, refresh }: { slave?: SlaveInfo; slaves: SlaveInfo[]; run: Run; refresh: () => Promise<void> }) {
-  const requestState = (state: number) => run(async () => {
-    const value = await bridgeRequest<SlaveInfo[]>("request_state", { position: slave?.position ?? 0, state });
-    await refresh();
-    return value;
-  }, `已请求 ${stateLabel(state)}`);
-  const repair = (method: "reconfig" | "recover", success: string) => slave && run(async () => {
-    const value = await bridgeRequest(method, { position: slave.position });
-    await refresh();
-    return value;
-  }, success);
+function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfile, onRegisterProfileChange, alLanguage }: { slave?: SlaveInfo; slaves: SlaveInfo[]; status: WorkbenchStatus; busy: boolean; run: Run; refresh: () => Promise<void>; registerProfile: string; onRegisterProfileChange: (profile: string) => void; alLanguage: AlStatusLanguage }) {
+  const requestState = (state: number) => run(
+    () => bridgeRequest<SlaveInfo[]>("request_state", { position: slave?.position ?? 0, state }),
+    `已请求 ${stateLabel(state)}`,
+  );
+  const repair = (method: "reconfig" | "recover", success: string) => slave && run(
+    () => bridgeRequest<{ slaves: SlaveInfo[] }>(method, { position: slave.position }),
+    success,
+  );
   const allOp = slaves.length > 0 && slaves.every((item) => item.state === 8);
+  const alInfo = alStatusInfo(slave?.al_status ?? 0, alLanguage);
   return (
     <>
-      <PageTitle title="设备概览" subtitle={slave ? `从站 ${slave.position} · ${slave.name}` : "总线状态与设备信息"} actions={<Button startIcon={<RefreshRounded />} onClick={() => run(refresh)}>刷新状态</Button>} />
+      <PageTitle title="设备概览" subtitle={slave ? `从站 ${slave.position} · ${slave.name}` : "总线状态与设备信息"} actions={<Button disabled={busy} startIcon={<RefreshRounded />} onClick={() => run(refresh)}>刷新状态</Button>} />
+      {status.last_error && <Alert severity={status.phase === "faulted" ? "error" : "warning"} sx={{ mb: 1.25 }}>
+        <Typography fontWeight={700}>最近通信问题</Typography>
+        <Typography variant="body2">{status.last_error}</Typography>
+        <Typography variant="caption" display="block" sx={{ mt: 0.35 }}>先刷新状态；若问题持续，请检查链路、从站供电与 AL 状态码，再进行重配置或故障恢复。</Typography>
+      </Alert>}
       {!slave ? <EmptyState text="连接并扫描后，在左侧选择一个从站" /> : (
-        <Stack spacing={1.5}>
-          <Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))", gap: 1.5 }}>
-            {[
-              ["当前状态", <StateChip state={slave.state} />],
-              ["输入 / 输出", `${slave.input_size} B / ${slave.output_size} B`],
-              ["ESC", slave.chip_model],
-              ["寄存器族", slave.register_family],
-              ["Vendor ID", hex(slave.identity.vendor_id, 8)],
-              ["Product Code", hex(slave.identity.product_code, 8)],
-              ["Revision", hex(slave.identity.revision, 8)],
-              ["Serial Number", hex(slave.identity.serial_number, 8)],
-              ["配置地址", slave.configured_address === undefined ? "—" : hex(slave.configured_address)],
-              ["AL 状态码", hex(slave.al_status)],
-            ].map(([label, value]) => <Card sx={cardSx} key={String(label)}><CardContent sx={{ p: "16px !important" }}><Typography variant="caption" color="text.secondary">{label}</Typography><Box sx={{ mt: 0.7, fontWeight: 700, fontSize: 16 }}>{value}</Box></CardContent></Card>)}
-          </Box>
+        <Stack spacing={1.25}>
           <Card sx={cardSx}>
             <CardContent>
-              <Typography variant="h6" gutterBottom>状态控制</Typography>
-              <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>状态请求由后台串行执行，并在完成后重新读取总线状态。</Typography>
-              <Stack direction="row" gap={1} flexWrap="wrap">
-                {[1, 2, 4, 8].map((state) => <Button key={state} variant={slave.state === state ? "contained" : "outlined"} onClick={() => requestState(state)}>{stateLabel(state)}</Button>)}
-                <Divider orientation="vertical" flexItem sx={{ mx: 1 }} />
-                <Button color="warning" onClick={() => repair("reconfig", "重配置完成")}>重配置</Button>
-                <Button color="warning" onClick={() => repair("recover", "恢复完成")}>故障恢复</Button>
+              <Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(155px, 1fr))", gap: 1.5, alignItems: "center" }}>
+                <Box>
+                  <Typography className="section-label">当前状态</Typography>
+                  <Stack direction="row" alignItems="center" gap={1} sx={{ mt: 0.45 }}>
+                    <StateChip state={slave.state} />
+                    <Typography variant="body2" color="text.secondary">从站 {slave.position}</Typography>
+                  </Stack>
+                </Box>
+                <Box><Typography className="section-label">输入 / 输出</Typography><Typography className="kv-value mono" fontWeight={700}>{slave.input_size} B / {slave.output_size} B</Typography></Box>
+                <Box><Typography className="section-label">总线阶段</Typography><Typography className="kv-value" fontWeight={700}>{masterPhaseLabels[status.phase]}</Typography><Typography variant="caption" color="text.secondary">{status.connected ? "通信核心已连接" : "尚未连接网卡"}</Typography></Box>
+                <Box><Typography className="section-label">检测 ESC / 寄存器族</Typography><Typography className="kv-value" fontWeight={700} title={`${slave.chip_model} / ${slave.register_family}`}>{slave.chip_model} / {slave.register_family}</Typography></Box>
+                <Box><FormControl size="small" fullWidth><InputLabel>寄存器目录</InputLabel><Select label="寄存器目录" value={registerProfile} onChange={(event) => onRegisterProfileChange(String(event.target.value))}>{registerProfiles.map((profile) => <MenuItem key={profile} value={profile}>{profile} · {registerProfileFamily[profile]}</MenuItem>)}</Select></FormControl><Typography variant="caption" color="text.secondary">仅决定目录与安全规则，不改变硬件识别。</Typography></Box>
+                <Box><Typography className="section-label">AL 状态码</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.al_status)}</Typography><Typography variant="caption" color={slave.al_status ? "warning.main" : "text.secondary"}>{alInfo.name}</Typography></Box>
+              </Box>
+              {profileCompatibilityText(slave.chip_model) && <Alert severity="info" sx={{ mt: 1.5 }}>{profileCompatibilityText(slave.chip_model)}</Alert>}
+              {slave.al_status !== 0 && <Alert severity={alInfo.known ? "warning" : "error"} sx={{ mt: 1.5 }}><Typography fontWeight={700}>{hex(slave.al_status)} · {alInfo.name}</Typography><Typography variant="body2">说明：{alInfo.detail}</Typography><Typography variant="body2">排查：{alInfo.action}</Typography></Alert>}
+            </CardContent>
+          </Card>
+          <Card sx={cardSx}>
+            <CardContent>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1.25 }}>
+                <Box><Typography variant="h6">设备身份</Typography><Typography variant="caption" color="text.secondary">当前从站的识别与地址信息</Typography></Box>
+                <Chip size="small" variant="outlined" label={slave.configured_address === undefined ? "配置地址：未知" : `配置地址：${hex(slave.configured_address)}`} />
+              </Stack>
+              <Box className="kv-grid">
+                <Box className="kv-item"><Typography className="section-label">Vendor ID（厂商 ID）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.vendor_id, 8)}</Typography></Box>
+                <Box className="kv-item"><Typography className="section-label">Product Code（产品代码）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.product_code, 8)}</Typography></Box>
+                <Box className="kv-item"><Typography className="section-label">Revision（修订版本）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.revision, 8)}</Typography></Box>
+                <Box className="kv-item"><Typography className="section-label">Serial Number（序列号）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.serial_number, 8)}</Typography></Box>
+              </Box>
+            </CardContent>
+          </Card>
+          <Card sx={cardSx}>
+            <CardContent>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
+                <Box><Typography variant="h6">状态控制</Typography><Typography variant="caption" color="text.secondary">请求由后台串行执行，完成后重新读取总线状态。</Typography></Box>
+                <Chip size="small" variant="outlined" label={allOp ? "总线已就绪" : `${slaves.length} 个从站`} />
+              </Stack>
+              <Stack direction="row" gap={0.75} flexWrap="wrap">
+                {[1, 2, 4, 8].map((state) => <Button disabled={busy || status.cycle_running} key={state} variant={slave.state === state ? "contained" : "outlined"} onClick={() => requestState(state)}>{stateLabel(state)}</Button>)}
+                <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+                <Button disabled={busy || status.cycle_running} size="small" color="warning" onClick={() => repair("reconfig", "重配置完成")}>重配置</Button>
+                <Button disabled={busy || status.cycle_running} size="small" color="warning" onClick={() => repair("recover", "恢复并通过状态复核")}>故障恢复</Button>
               </Stack>
             </CardContent>
           </Card>
-          <Alert severity={allOp ? "success" : "info"}>{allOp ? "全部从站处于 OP，总线已就绪。" : `已发现 ${slaves.length} 个从站；可在概览中逐站控制状态。`}</Alert>
+          <Alert severity={allOp ? "success" : slave.al_status ? "warning" : "info"}>{allOp ? "全部从站处于 OP，总线已就绪。" : slave.al_status ? `当前从站报告 AL 状态码 ${hex(slave.al_status)}：${alInfo.name}。` : `已发现 ${slaves.length} 个从站；可在概览中逐站控制状态。`}</Alert>
         </Stack>
       )}
     </>
@@ -251,43 +338,89 @@ function littleEndianValue(data: string): bigint {
   return data.trim().split(/\s+/).filter(Boolean).reduceRight((value, byte) => (value << 8n) | BigInt(`0x${byte}`), 0n);
 }
 
-function RegistersPage({ slave, run }: { slave?: SlaveInfo; run: Run }) {
+function RegistersPage({ slave, run, registerProfile }: { slave?: SlaveInfo; run: Run; registerProfile: string }) {
   const [catalog, setCatalog] = useState<RegisterDefinition[]>([]);
+  const [catalogError, setCatalogError] = useState("");
   const [selected, setSelected] = useState<RegisterDefinition>();
   const [query, setQuery] = useState("");
+  const [group, setGroup] = useState("全部类别");
   const [result, setResult] = useState<RegisterValue>();
+  const [readingDefinitionId, setReadingDefinitionId] = useState<string>();
+  const [copied, setCopied] = useState(false);
   const [pinned, setPinned] = useState<RegisterDefinition[]>([]);
   const [watchValues, setWatchValues] = useState<Record<string, RegisterValue>>({});
+  const [changedWatchKeys, setChangedWatchKeys] = useState<Set<string>>(new Set());
+  const watchValuesRef = useRef<Record<string, RegisterValue>>({});
+  const highlightTimerRef = useRef<number | undefined>(undefined);
   const [watching, setWatching] = useState(false);
   const [watchError, setWatchError] = useState("");
   const [intervalMs, setIntervalMs] = useState(1000);
   const [writeOpen, setWriteOpen] = useState(false);
   const [writeContext, setWriteContext] = useState<RegisterWriteContext>();
   const [writeData, setWriteData] = useState("");
-  const [plan, setPlan] = useState<{ plan_id: string; plan: Record<string, unknown> }>();
+  const [plan, setPlan] = useState<{ plan_id: string; plan: Record<string, unknown>; expiresAt: number }>();
+  const [planNow, setPlanNow] = useState(Date.now());
   const [resetConfirm, setResetConfirm] = useState(false);
   const [rawAddress, setRawAddress] = useState("0x0000");
   const [rawSize, setRawSize] = useState(1);
   const [rawResult, setRawResult] = useState<RegisterValue>();
   const [rawAccess, setRawAccess] = useState("RW");
-  const watchInFlight = useRef(false);
+  const identityKey = slaveIdentityKey(slave);
+  const registerContext = `${identityKey}:${registerProfile}`;
+  const registerContextRef = useRef(registerContext);
+  registerContextRef.current = registerContext;
 
-  useEffect(() => { bridgeRequest<RegisterDefinition[]>("register_catalog").then(setCatalog); }, []);
+  useEffect(() => {
+    if (!slave) { setCatalog([]); setCatalogError(""); return; }
+    let active = true;
+    setCatalog([]); setCatalogError("");
+    bridgeRequest<RegisterDefinition[]>("register_catalog", { position: slave.position, profile: registerProfile })
+      .then((value) => { if (active) setCatalog(value); })
+      .catch((error) => { if (active) setCatalogError(error instanceof Error ? error.message : String(error)); });
+    return () => { active = false; };
+  }, [identityKey, registerProfile]);
+  useEffect(() => {
+    if (!plan) return;
+    setPlanNow(Date.now());
+    const timer = window.setInterval(() => setPlanNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [plan?.plan_id]);
   useEffect(() => {
     setSelected(undefined); setResult(undefined); setPinned([]); setWatchValues({}); setWatching(false);
-    setWatchError(""); setPlan(undefined); setWriteOpen(false); setResetConfirm(false); setRawResult(undefined);
-  }, [slave?.position]);
+    setWatchError(""); setPlan(undefined); setWriteOpen(false); setResetConfirm(false); setRawResult(undefined); setGroup("全部类别");
+  }, [identityKey, registerProfile]);
 
-  const filtered = catalog.filter((definition) =>
-    `${definition.name} ${definition.group} ${definition.description} ${hex(definition.address)}`
+  const groups = useMemo(() => ["全部类别", ...Array.from(new Set(catalog.map((definition) => definition.group))).sort()], [catalog]);
+  const filtered = catalog.filter((definition) => group === "全部类别" || definition.group === group).filter((definition) =>
+    `${definition.name} ${definition.group} ${definition.description} ${definition.address_text ?? hex(definition.address)} ${definition.address_space_label ?? ""}`
       .toLowerCase().includes(query.toLowerCase()),
   );
   const read = async (definition: RegisterDefinition) => {
+    if (operationStore.active("register_read")) return;
+    const requestedContext = registerContextRef.current;
     setSelected(definition);
     if (!slave) return;
-    await run(() => bridgeRequest<RegisterValue>("register_read", {
-      position: slave.position, address: definition.address, size: definition.width ?? definition.size,
-    }).then((value) => { setResult(value); return value; }));
+    setReadingDefinitionId(definition.definition_id);
+    try {
+      const detail = await run(() => bridgeRequest<RegisterDefinition>("register_definition", {
+        position: slave.position, definition_id: definition.definition_id, profile: registerProfile,
+      }));
+      if (!detail || registerContextRef.current !== requestedContext) return;
+      setSelected(detail);
+      if (detail.direct_read_allowed === false) { setResult(undefined); return; }
+      const value = await run(() => bridgeRequest<RegisterValue>("register_read", {
+        position: slave.position, address: detail.address, size: detail.width ?? detail.size, definition_id: detail.definition_id, profile: registerProfile,
+      }));
+      if (value && registerContextRef.current === requestedContext) setResult(value);
+    } finally {
+      if (registerContextRef.current === requestedContext) setReadingDefinitionId(undefined);
+    }
+  };
+  const copyReadValue = async () => {
+    if (!result?.data) return;
+    await navigator.clipboard.writeText(result.data);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
   };
   const readRaw = async () => {
     if (!slave) return;
@@ -301,28 +434,33 @@ function RegistersPage({ slave, run }: { slave?: SlaveInfo; run: Run }) {
   useEffect(() => {
     if (!watching || !pinned.length || !slave) return;
     let active = true;
+    let timer: number | undefined;
     const poll = async () => {
-      if (watchInFlight.current) return;
-      watchInFlight.current = true;
       try {
         const values = await bridgeRequest<RegisterValue[]>("register_watch", {
           position: slave.position,
-          requests: pinned.map((definition) => ({ address: definition.address, size: definition.width ?? definition.size })),
+          requests: pinned.map((definition) => ({ address: definition.address, size: definition.width ?? definition.size, definition_id: definition.definition_id, profile: registerProfile })),
         });
         if (active) {
-          setWatchValues(Object.fromEntries(values.map((value) => [registerKey(value.address, value.data.split(/\s+/).length), value])));
+          const nextValues = Object.fromEntries(values.map((value) => [registerKey(value.address, value.data.split(/\s+/).length), value]));
+          const changed = new Set(Object.entries(nextValues).filter(([key, value]) => watchValuesRef.current[key] && watchValuesRef.current[key].data !== value.data).map(([key]) => key));
+          watchValuesRef.current = nextValues;
+          setWatchValues(nextValues);
+          setChangedWatchKeys(changed);
+          if (highlightTimerRef.current !== undefined) window.clearTimeout(highlightTimerRef.current);
+          highlightTimerRef.current = window.setTimeout(() => setChangedWatchKeys(new Set()), 850);
           setWatchError("");
         }
       } catch (error) {
         if (active) { setWatching(false); setWatchError(error instanceof Error ? error.message : String(error)); }
-      } finally { watchInFlight.current = false; }
+      } finally { if (active) timer = window.setTimeout(poll, intervalMs); }
     };
     void poll();
-    const timer = window.setInterval(poll, intervalMs);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [watching, pinned, slave, intervalMs]);
+    return () => { active = false; if (timer !== undefined) window.clearTimeout(timer); };
+  }, [watching, pinned, slave, intervalMs, registerProfile]);
 
   const togglePinned = (definition: RegisterDefinition) => {
+    if (definition.direct_read_allowed === false) return;
     const width = definition.width ?? definition.size ?? 1;
     const exists = pinned.some((item) => item.address === definition.address && (item.width ?? item.size) === width);
     setPinned((items) => exists
@@ -340,11 +478,11 @@ function RegistersPage({ slave, run }: { slave?: SlaveInfo; run: Run }) {
   };
   const prepareWrite = async () => {
     if (!slave || !writeContext) return;
-    const value = await run(() => bridgeRequest<{ plan_id: string; plan: Record<string, unknown> }>(
+    const value = await run(() => bridgeRequest<{ plan_id: string; plan: Record<string, unknown>; expires_in_seconds: number }>(
       "register_prepare_write",
-      { position: slave.position, address: writeContext.address, data: writeData, semantics: writeContext.access, known_register: writeContext.known },
+      { position: slave.position, address: writeContext.address, size: writeContext.width, data: writeData, semantics: writeContext.access, known_register: writeContext.known, definition_id: selected?.definition_id, profile: registerProfile },
     ));
-    if (value) setPlan(value);
+    if (value) setPlan({ plan_id: value.plan_id, plan: value.plan, expiresAt: Date.now() + value.expires_in_seconds * 1000 });
   };
   const executeWrite = async () => {
     if (!plan) return;
@@ -362,36 +500,82 @@ function RegistersPage({ slave, run }: { slave?: SlaveInfo; run: Run }) {
       value: (value >> BigInt(field.shift)) & ((1n << BigInt(field.bits)) - 1n),
     }));
   }, [selected, result]);
+  const planRemaining = plan ? Math.max(0, Math.ceil((plan.expiresAt - planNow) / 1000)) : 0;
+  const planExpired = Boolean(plan && planRemaining === 0);
 
-  return <><PageTitle title="寄存器" subtitle={slave ? `从站 ${slave.position} · ${slave.chip_model} · ${slave.register_family}` : "标准 ESC 寄存器读取与诊断"} />
+  return <><PageTitle title="寄存器" subtitle={slave ? `从站 ${slave.position} · 使用 ${registerProfile} · ${registerProfileFamily[registerProfile]}` : "标准 ESC 寄存器读取与诊断"} actions={<Stack direction="row" gap={1} alignItems="center">{readingDefinitionId && <><CircularProgress size={18} /><Typography variant="caption">正在读取寄存器…</Typography></>}{result?.data && <Button size="small" variant="outlined" onClick={() => void copyReadValue()}>{copied ? "已复制" : "复制读取值"}</Button>}</Stack>} />
     {!slave ? <EmptyState text="请先选择从站" /> : <Stack spacing={1.5}>
       <Alert severity="info">目标：从站 {slave.position} · 配置地址 {slave.configured_address === undefined ? "未知" : hex(slave.configured_address)} · 默认只读；所有写入均记录 AUDIT。</Alert>
-      <Box sx={{ display: "grid", gridTemplateColumns: "minmax(340px, 0.85fr) minmax(0, 1.15fr)", gap: 1.5, minHeight: 0 }}>
-        <Card sx={cardSx}><CardContent sx={{ pb: "14px !important" }}><TextField fullWidth size="small" placeholder="搜索名称、地址或分组" value={query} onChange={(e) => setQuery(e.target.value)} /></CardContent><Divider /><List dense sx={{ overflow: "auto", maxHeight: "calc(100vh - 330px)", p: 0.8 }}>{filtered.map((definition) => <ListItemButton selected={selected?.address === definition.address} key={`${definition.address}-${definition.name}`} onClick={() => void read(definition)}><ListItemText primary={definition.name} secondary={`${hex(definition.address)} · ${definition.group}`} /><Chip size="small" variant="outlined" label={definition.access} /></ListItemButton>)}</List></Card>
-        <Card sx={cardSx}><CardContent>{selected ? <Stack spacing={2}><Stack direction="row" justifyContent="space-between"><Box><Typography variant="h6">{selected.name}</Typography><Typography color="text.secondary">{selected.description}</Typography></Box><Chip label={selected.access} size="small" /></Stack><Divider /><Box sx={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 2 }}><Box><Typography variant="caption" color="text.secondary">地址</Typography><Typography className="mono">{hex(selected.address)}</Typography></Box><Box><Typography variant="caption" color="text.secondary">宽度</Typography><Typography>{selected.width ?? selected.size} byte</Typography></Box><Box><Typography variant="caption" color="text.secondary">WKC</Typography><Typography>{result ? result.wkc : "—"}</Typography></Box></Box><Box><Typography variant="caption" color="text.secondary">读取值</Typography><Typography className="mono" sx={{ mt: 1, p: 2, borderRadius: 2, bgcolor: "#F6F8FC", fontSize: 22 }}>{result?.data ?? "选择即读取"}</Typography></Box>{decodedFields.length > 0 && <Box><Typography variant="caption" color="text.secondary">位字段</Typography><Stack direction="row" gap={0.7} flexWrap="wrap" sx={{ mt: 0.8 }}>{decodedFields.map((field) => <Chip key={field.name} size="small" label={`${field.name}: ${field.value}`} />)}</Stack></Box>}<Stack direction="row" gap={1} alignItems="center"><Button variant={pinned.some((item) => item.address === selected.address) ? "contained" : "outlined"} onClick={() => togglePinned(selected)}>{pinned.some((item) => item.address === selected.address) ? "取消固定" : "固定监视"}</Button>{selected.address === 0x0040 ? <Button color="error" onClick={() => setResetConfirm(true)}>发送三帧 RES</Button> : selected.access !== "RO" && <Button color="warning" onClick={() => openWrite({ address: selected.address, width: selected.width ?? selected.size ?? 1, name: selected.name, access: selected.access, known: true })}>进入写入模式</Button>}</Stack><Alert severity={selected.access === "RO" ? "info" : "warning"}>{selected.access === "RO" ? "只读寄存器，不提供写入操作。" : selected.address === 0x0040 ? "复位只允许以三个连续、独立 FPWR 发送 52、45、53。" : `${selected.access} 写入严格使用定义宽度，并在第二次确认后执行。`}</Alert></Stack> : <Box sx={{ minHeight: 300, display: "grid", placeItems: "center", color: "text.secondary" }}>从左侧选择寄存器即可读取</Box>}</CardContent></Card>
+      {profileCompatibilityText(slave.chip_model) && <Alert severity="info">{profileCompatibilityText(slave.chip_model)} 当前显示的 {registerProfile} 是文档目录选择，不会将 E252 伪装为原厂 LAN9252。</Alert>}
+      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(250px, .78fr) minmax(0, 1.22fr)", xl: "minmax(270px, .78fr) minmax(0, 1.22fr)" }, gap: 1.25, minHeight: 0 }}>
+        <Card sx={cardSx}>
+          <CardContent sx={{ pb: "10px !important" }}>
+            <Stack spacing={0.8}>
+              <TextField fullWidth size="small" placeholder="搜索名称、地址、类别或地址空间" value={query} onChange={(e) => setQuery(e.target.value)} />
+              <FormControl fullWidth size="small"><InputLabel>类别</InputLabel><Select label="类别" value={group} onChange={(e) => setGroup(String(e.target.value))}>{groups.map((item) => <MenuItem value={item} key={item}>{item}</MenuItem>)}</Select></FormControl>
+              <Typography variant="caption" color="text.secondary">{filtered.length} / {catalog.length} 项；本地 PDI/HBI/PHY 项仅供查阅。</Typography>
+              {catalogError && <Alert severity="error">加载 {registerProfile} 寄存器目录失败：{catalogError}</Alert>}
+            </Stack>
+          </CardContent>
+          <Divider />
+          <List dense sx={{ overflow: "auto", maxHeight: "calc(100vh - 350px)", p: 0.6 }}>
+            {filtered.map((definition) => <ListItemButton disabled={Boolean(readingDefinitionId)} selected={selected?.definition_id === definition.definition_id} key={definition.definition_id ?? `${definition.address}-${definition.name}`} onClick={() => void read(definition)} sx={{ py: 0.55, px: 0.8 }}><ListItemText primary={definition.name} secondary={`${definition.address_text ?? hex(definition.address)} · ${definition.group} · ${definition.address_space_label ?? "ESC"}`} primaryTypographyProps={{ fontSize: 13 }} secondaryTypographyProps={{ fontSize: 11.5 }} /><Stack alignItems="flex-end" gap={0.35}>{readingDefinitionId === definition.definition_id ? <CircularProgress size={18} /> : <Chip size="small" variant="outlined" label={definition.access} />}{definition.direct_read_allowed === false && <Chip size="small" color="warning" variant="outlined" label="本地访问" />}</Stack></ListItemButton>)}
+            {!catalogError && catalog.length > 0 && filtered.length === 0 && <Box sx={{ py: 6, px: 2, textAlign: "center", color: "text.secondary" }}><Typography fontWeight={700}>没有匹配的寄存器</Typography><Typography variant="caption">请调整搜索词或类别筛选。</Typography></Box>}
+          </List>
+        </Card>
+        <Card sx={cardSx}><CardContent>{selected ? <Stack spacing={1.25}><Stack direction="row" justifyContent="space-between" gap={1}><Box minWidth={0}><Typography variant="h6" noWrap title={selected.name}>{selected.name}</Typography><Typography variant="body2" color="text.secondary" noWrap title={selected.description}>{selected.description}</Typography></Box><Chip label={selected.access} size="small" /></Stack><Divider /><Box sx={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 1.25 }}><Box><Typography className="section-label">地址 / 空间</Typography><Typography className="mono kv-value">{selected.address_text ?? hex(selected.address)}</Typography><Typography variant="caption" color="text.secondary">{selected.address_space_label ?? "ESC Core"}</Typography></Box><Box><Typography className="section-label">宽度 / 主站权限</Typography><Typography className="kv-value">{selected.width ?? selected.size} byte</Typography><Typography variant="caption" color="text.secondary">{selected.master_access ?? selected.access}</Typography></Box><Box><Typography className="section-label">WKC / 可信度</Typography><Typography className="kv-value">{result ? result.wkc : "—"}</Typography><Typography variant="caption" color="text.secondary">{selected.confidence ?? "—"}</Typography></Box></Box>{selected.direct_read_allowed === false ? <Alert severity="warning">此项属于 {selected.address_space_label}，或未声明允许 EtherCAT 主站访问；当前桥接不会发送 FPRD/FPWR。</Alert> : <Box><Typography className="section-label">读取值</Typography><Typography className="mono data-surface" sx={{ mt: 0.6, p: 1.25, fontSize: 17, minHeight: 42, display: "flex", alignItems: "center" }}>{result?.data ?? "选择即读取"}</Typography></Box>}<Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 0.8 }}><Box><Typography className="section-label">复位 / 上电默认值</Typography><Typography variant="body2">{selected.reset_value ?? "未记录"} / {selected.power_on_default ?? "未记录"}</Typography></Box><Box><Typography className="section-label">状态限制</Typography><Typography variant="body2">{selected.state_restriction ?? "未记录"}</Typography></Box><Box><Typography className="section-label">保留位规则</Typography><Typography variant="body2">{selected.reserved_bits_rule ?? "未记录"}</Typography></Box></Box>{selected.fields && <Box><Typography className="section-label">位字段与 EtherCAT 访问权限</Typography><TableContainer sx={{ mt: 0.6, maxHeight: 180 }}><Table size="small" stickyHeader><TableHead><TableRow><TableCell>Bits</TableCell><TableCell>字段</TableCell><TableCell>访问</TableCell><TableCell>说明</TableCell></TableRow></TableHead><TableBody>{selected.fields.map((field, index) => <TableRow key={`${field.bits}-${field.name}-${index}`}><TableCell className="mono">{field.bits}</TableCell><TableCell>{field.name}{field.reserved && "（保留）"}</TableCell><TableCell>{field.ecat_access ?? field.access ?? "—"}</TableCell><TableCell title={field.description}>{field.description || "—"}</TableCell></TableRow>)}</TableBody></Table></TableContainer></Box>}{decodedFields.length > 0 && <Box><Typography className="section-label">当前值解码</Typography><Stack direction="row" gap={0.6} flexWrap="wrap" sx={{ mt: 0.6 }}>{decodedFields.map((field) => <Chip key={field.name} size="small" label={`${field.name}: ${field.value}`} />)}</Stack></Box>}<Stack direction="row" gap={0.75} alignItems="center" flexWrap="wrap">{selected.direct_read_allowed !== false && <Button size="small" variant={pinned.some((item) => item.definition_id === selected.definition_id) ? "contained" : "outlined"} onClick={() => togglePinned(selected)}>{pinned.some((item) => item.definition_id === selected.definition_id) ? "取消固定" : "固定监视"}</Button>}{selected.address === 0x0040 && selected.direct_read_allowed !== false ? <Button size="small" color="error" onClick={() => setResetConfirm(true)}>发送三帧 RES</Button> : selected.direct_write_allowed && <Button size="small" color="warning" onClick={() => openWrite({ address: selected.address, width: selected.width ?? selected.size ?? 1, name: selected.name, access: selected.access, known: true })}>{selected.access === "W1C" || selected.access === "W1S" ? "操作掩码" : selected.access === "WAC" ? "清零操作" : "进入写入模式"}</Button>}</Stack><Alert sx={{ py: 0.35 }} severity={selected.direct_write_allowed ? "warning" : "info"}>{selected.direct_write_allowed ? `${selected.access} 写入严格使用定义宽度，并在第二次确认后执行。` : selected.dangerous ? "该项含混合权限、保留位、状态限制或副作用；普通整寄存器写入已禁用。" : "只读寄存器，不提供写入操作。"}</Alert></Stack> : <Box sx={{ minHeight: 240, display: "grid", placeItems: "center", color: "text.secondary" }}>从左侧选择寄存器即可读取</Box>}</CardContent></Card>
       </Box>
-      <Card sx={cardSx}><CardContent><Stack direction="row" justifyContent="space-between" alignItems="center"><Box><Typography variant="h6">固定监视</Typography><Typography variant="body2" color="text.secondary">合并相邻范围；同一时刻最多一个请求在途，失败后自动暂停。</Typography></Box><Stack direction="row" gap={1}><FormControl size="small" sx={{ width: 130 }}><InputLabel>刷新周期</InputLabel><Select label="刷新周期" value={intervalMs} disabled={watching} onChange={(e) => setIntervalMs(Number(e.target.value))}>{[500, 1000, 2000, 5000].map((value) => <MenuItem value={value} key={value}>{value} ms</MenuItem>)}</Select></FormControl><Button disabled={!pinned.length} variant={watching ? "contained" : "outlined"} onClick={() => setWatching(!watching)}>{watching ? "暂停" : "开始"}</Button><Button disabled={!pinned.length} onClick={() => { setPinned([]); setWatchValues({}); setWatching(false); }}>清空</Button></Stack></Stack>{watchError && <Alert severity="error" sx={{ mt: 1.5 }}>{watchError}</Alert>}<TableContainer sx={{ mt: 1.5 }}><Table size="small"><TableHead><TableRow>{["地址", "名称", "值", "WKC", "耗时", "操作"].map((item) => <TableCell key={item}>{item}</TableCell>)}</TableRow></TableHead><TableBody>{pinned.map((definition) => { const width = definition.width ?? definition.size ?? 1; const value = watchValues[registerKey(definition.address, width)]; return <TableRow key={registerKey(definition.address, width)}><TableCell className="mono">{hex(definition.address)}</TableCell><TableCell>{definition.name}</TableCell><TableCell className="mono">{value?.data ?? "—"}</TableCell><TableCell>{value?.wkc ?? "—"}</TableCell><TableCell>{value ? `${value.duration_ms.toFixed(2)} ms` : "—"}</TableCell><TableCell><Button size="small" onClick={() => removePinned(definition)}>移除</Button></TableCell></TableRow>; })}{!pinned.length && <TableRow><TableCell colSpan={6} align="center" sx={{ py: 3, color: "text.secondary" }}>从标准寄存器详情中固定需要监视的项目</TableCell></TableRow>}</TableBody></Table></TableContainer></CardContent></Card>
-        <Accordion disableGutters><AccordionSummary expandIcon={<ExpandMoreRounded />}><Box><Typography fontWeight={700}>原始地址工具</Typography><Typography variant="caption" color="text.secondary">用于未收录地址；写入不会假定寄存器语义，请对照数据手册。</Typography></Box></AccordionSummary><AccordionDetails><Alert severity="warning" sx={{ mb: 1.5 }}>未知地址写入可能破坏链路、状态机或 EEPROM 控制状态，仍会生成计划、二次确认并记录 AUDIT。</Alert><Stack direction="row" gap={1} alignItems="center" flexWrap="wrap"><TextField size="small" label="地址" value={rawAddress} onChange={(e) => setRawAddress(e.target.value)} inputProps={{ className: "mono" }} sx={{ width: 150 }} /><TextField size="small" type="number" label="宽度" value={rawSize} onChange={(e) => setRawSize(Number(e.target.value))} inputProps={{ min: 1, max: 256 }} sx={{ width: 110 }} /><Button variant="outlined" disabled={parseHexInput(rawAddress) === undefined} onClick={readRaw}>读取</Button><FormControl size="small" sx={{ width: 150 }}><InputLabel>写入语义</InputLabel><Select label="写入语义" value={rawAccess} onChange={(e) => setRawAccess(e.target.value)}>{["RW", "WO", "W1C", "W1S", "WAC", "SELF_CLEARING", "VOLATILE"].map((item) => <MenuItem value={item} key={item}>{item}</MenuItem>)}</Select></FormControl><Button color="warning" disabled={parseHexInput(rawAddress) === undefined} onClick={() => openWrite({ address: parseHexInput(rawAddress) ?? 0, width: rawSize, name: `原始地址 ${rawAddress}`, access: rawAccess, known: false })}>写入工具</Button><Typography className="mono">{rawResult?.data ?? ""}</Typography></Stack></AccordionDetails></Accordion>
+      <Card sx={cardSx}>
+        <CardContent>
+          <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+            <Box minWidth={0}><Typography variant="h6">固定监视 {pinned.length > 0 && <Typography component="span" variant="caption" color="text.secondary">· {pinned.length} 项</Typography>}</Typography><Typography variant="caption" color="text.secondary">合并相邻范围；值变化时短暂高亮；失败后自动暂停。</Typography></Box>
+            <Stack direction="row" gap={0.75}><FormControl size="small" sx={{ width: 122 }}><InputLabel>刷新周期</InputLabel><Select label="刷新周期" value={intervalMs} disabled={watching} onChange={(e) => setIntervalMs(Number(e.target.value))}>{[500, 1000, 2000, 5000].map((value) => <MenuItem value={value} key={value}>{value} ms</MenuItem>)}</Select></FormControl><Button size="small" disabled={!pinned.length} variant={watching ? "contained" : "outlined"} onClick={() => setWatching(!watching)}>{watching ? "暂停" : "开始"}</Button><Button size="small" disabled={!pinned.length} onClick={() => { setPinned([]); setWatchValues({}); watchValuesRef.current = {}; setWatching(false); }}>清空</Button></Stack>
+          </Stack>
+          {watchError && <Alert severity="error" sx={{ mt: 1 }}>{watchError}</Alert>}
+          <TableContainer sx={{ mt: 1 }}><Table size="small"><TableHead><TableRow>{["地址", "名称", "值", "耗时", "操作"].map((item) => <TableCell key={item}>{item}</TableCell>)}</TableRow></TableHead><TableBody>{pinned.map((definition) => { const width = definition.width ?? definition.size ?? 1; const key = registerKey(definition.address, width); const value = watchValues[key]; const changed = changedWatchKeys.has(key); return <TableRow key={key} sx={{ bgcolor: changed ? "warning.light" : "transparent", transition: "background-color .35s ease" }}><TableCell className="mono">{hex(definition.address)}</TableCell><TableCell>{definition.name}</TableCell><TableCell className="mono"><Stack direction="row" alignItems="center" gap={0.75}>{value?.data ?? "—"}{changed && <Chip size="small" color="warning" label="变化" />}</Stack></TableCell><TableCell>{value ? `${value.duration_ms.toFixed(2)} ms` : "—"}</TableCell><TableCell><Button size="small" onClick={() => removePinned(definition)}>移除</Button></TableCell></TableRow>; })}{!pinned.length && <TableRow><TableCell colSpan={5} align="center" sx={{ py: 2.5, color: "text.secondary" }}>从标准寄存器详情中固定需要监视的项目</TableCell></TableRow>}</TableBody></Table></TableContainer>
+        </CardContent>
+      </Card>
+        <Accordion disableGutters><AccordionSummary expandIcon={<ExpandMoreRounded />}><Box><Typography fontWeight={700}>原始地址工具</Typography><Typography variant="caption" color="text.secondary">用于未收录地址；宽度同时约束读取长度和写入 HEX 字节数。</Typography></Box></AccordionSummary><AccordionDetails><Alert severity="warning" sx={{ mb: 1.5 }}>未知地址写入可能破坏链路、状态机或 EEPROM 控制状态；写入数据必须与“宽度”完全一致，仍会生成计划、二次确认并记录 AUDIT。</Alert><Stack direction="row" gap={1} alignItems="center" flexWrap="wrap"><TextField size="small" label="地址" value={rawAddress} onChange={(e) => setRawAddress(e.target.value)} inputProps={{ className: "mono" }} sx={{ width: 150 }} /><TextField size="small" type="number" label="读写宽度（byte）" value={rawSize} onChange={(e) => setRawSize(Number(e.target.value))} inputProps={{ min: 1, max: 256 }} sx={{ width: 150 }} /><Button variant="outlined" disabled={parseHexInput(rawAddress) === undefined || !Number.isInteger(rawSize) || rawSize < 1 || rawSize > 256} onClick={readRaw}>读取</Button><FormControl size="small" sx={{ width: 150 }}><InputLabel>写入语义</InputLabel><Select label="写入语义" value={rawAccess} onChange={(e) => setRawAccess(e.target.value)}>{["RW", "WO", "W1C", "W1S", "WAC", "SELF_CLEARING", "VOLATILE"].map((item) => <MenuItem value={item} key={item}>{item}</MenuItem>)}</Select></FormControl><Button color="warning" disabled={parseHexInput(rawAddress) === undefined || !Number.isInteger(rawSize) || rawSize < 1 || rawSize > 256} onClick={() => openWrite({ address: parseHexInput(rawAddress) ?? 0, width: rawSize, name: `原始地址 ${rawAddress}`, access: rawAccess, known: false })}>写入工具</Button><Typography className="mono">{rawResult?.data ?? ""}</Typography></Stack></AccordionDetails></Accordion>
     </Stack>}
-    <Dialog open={writeOpen} onClose={() => { setWriteOpen(false); setPlan(undefined); }} fullWidth maxWidth="sm"><DialogTitle>寄存器安全写入</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Alert severity="warning">目标从站 {slave?.position ?? "—"} · {writeContext?.name} · {hex(writeContext?.address ?? 0)}。请确认访问语义和最终字节。</Alert><TextField label={writeContext?.access === "W1C" || writeContext?.access === "W1S" ? "操作掩码（HEX）" : `目标值（HEX，${writeContext?.known ? `必须 ${writeContext.width} B` : "1–256 B"}）`} value={writeData} onChange={(e) => { setWriteData(e.target.value); setPlan(undefined); }} inputProps={{ className: "mono" }} />{plan && <Box sx={{ p: 2, bgcolor: "#F7F8FB", borderRadius: 2 }}><Typography variant="subtitle2">写入计划</Typography><Typography className="mono">当前值：{String(plan.plan.current || "不可回读")}</Typography><Typography className="mono">目标值：{String(plan.plan.target)}</Typography><Typography className="mono">变化位：{String(plan.plan.changed_mask || "按语义执行")}</Typography></Box>}</Stack></DialogContent><DialogActions><Button onClick={() => { setWriteOpen(false); setPlan(undefined); }}>取消</Button>{!plan ? <Button variant="contained" color="warning" disabled={!writeData.trim()} onClick={prepareWrite}>生成写入计划</Button> : <Button variant="contained" color="error" onClick={executeWrite}>确认并执行</Button>}</DialogActions></Dialog>
-    <Dialog open={resetConfirm} onClose={() => setResetConfirm(false)}><DialogTitle>确认复位 EtherCAT 控制器</DialogTitle><DialogContent><Alert severity="error">将独占 Worker，以三个连续、独立 FPWR 向 0x0040 写入 52、45、53；从站会短暂掉线。</Alert></DialogContent><DialogActions><Button onClick={() => setResetConfirm(false)}>取消</Button><Button color="error" variant="contained" onClick={async () => { const value = await run(() => bridgeRequest("register_reset", { position: slave?.position }), "RES 复位序列已发送"); if (value) setResetConfirm(false); }}>确认并发送</Button></DialogActions></Dialog>
+    <Dialog open={writeOpen} onClose={() => { setWriteOpen(false); setPlan(undefined); }} fullWidth maxWidth="sm"><DialogTitle>寄存器安全写入</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Alert severity="warning">目标从站 {slave?.position ?? "—"} · {writeContext?.name} · {hex(writeContext?.address ?? 0)}。请确认访问语义和最终字节。</Alert><TextField label={writeContext?.access === "W1C" || writeContext?.access === "W1S" ? `操作掩码（HEX，必须 ${writeContext?.width ?? 0} B）` : `目标值（HEX，必须 ${writeContext?.width ?? 0} B）`} value={writeData} onChange={(e) => { setWriteData(e.target.value); setPlan(undefined); }} inputProps={{ className: "mono" }} />{plan && <Box sx={{ p: 2, bgcolor: "#F7F8FB", borderRadius: 2 }}><Stack direction="row" justifyContent="space-between"><Typography variant="subtitle2">写入计划</Typography><Chip size="small" color={planExpired ? "error" : planRemaining <= 10 ? "warning" : "default"} label={planExpired ? "已过期" : `${planRemaining} 秒后过期`} /></Stack><Typography className="mono">当前值：{String(plan.plan.current || "不可回读")}</Typography><Typography className="mono">目标值：{String(plan.plan.target)}</Typography><Typography className="mono">变化位：{String(plan.plan.changed_mask || "按语义执行")}</Typography>{planExpired && <Alert severity="warning" sx={{ mt: 1 }}>计划已超过 60 秒，请重新生成并确认。</Alert>}</Box>}</Stack></DialogContent><DialogActions><Button onClick={() => { setWriteOpen(false); setPlan(undefined); }}>取消</Button>{!plan || planExpired ? <Button variant="contained" color="warning" disabled={!writeData.trim()} onClick={prepareWrite}>重新生成写入计划</Button> : <Button variant="contained" color="error" onClick={executeWrite}>确认并执行</Button>}</DialogActions></Dialog>
+    <Dialog open={resetConfirm} onClose={() => setResetConfirm(false)}><DialogTitle>确认复位 EtherCAT 控制器</DialogTitle><DialogContent><Alert severity="error">将独占 Worker，以三个连续、独立 FPWR 向 0x0040 写入 52、45、53；从站会短暂掉线。</Alert></DialogContent><DialogActions><Button onClick={() => setResetConfirm(false)}>取消</Button><Button color="error" variant="contained" onClick={async () => { const value = await run(() => bridgeRequest("register_reset", { position: slave?.position, profile: registerProfile }), "RES 复位序列已发送"); if (value) setResetConfirm(false); }}>确认并发送</Button></DialogActions></Dialog>
   </>;
 }
 
 interface EsiResult { document_id: string; path: string; vendor_id: number; vendor_name: string; devices: EsiDevice[] }
-interface TargetResult { target_id: string; size: number; sha256: string; supported: string[]; omitted: string[]; device: EsiDevice }
+interface SiiLayoutItem { kind?: number; name: string; offset: number; length: number; content: string }
+interface TargetResult { target_id: string; size: number; sha256: string; supported: string[]; omitted: string[]; device: EsiDevice; layout: SiiLayoutItem[] }
 interface ProgressState extends OperationProgress { percent: number; tone?: "error" | "success" | "info" }
 interface EepromComparisonResult { equal: boolean; differing_bytes: number; first_difference?: number; target_sha256: string; readback_sha256: string }
 interface EepromReadResult { data: string; size: number; sha256: string; read_at: string; sii_valid: boolean; sii_error?: string; identity?: { vendor_id: number; product_code: number; revision: number; serial_number: number }; category_count?: number; categories?: number[]; end_offset?: number; comparison?: EepromComparisonResult }
 interface EepromFlashDetails { bytes_read_back: number; words_written: number; comparison: EepromComparisonResult; sii_valid: boolean; semantic_valid: boolean; image_verification: string; reset_sequence?: boolean[]; rediscovered?: boolean; reload_verified?: boolean }
 interface EepromFlashPayload { success: boolean; result: EepromFlashDetails; slaves: SlaveInfo[] }
-interface EepromOperationResult { title: string; severity: "success" | "warning" | "error"; payload?: EepromFlashPayload; error?: string }
+interface EepromOperationResult { title: string; severity: "success" | "warning" | "error" | "info"; payload?: EepromFlashPayload; error?: string }
+
+function targetNeedsAttention(target: TargetResult): boolean {
+  return target.omitted.some((item) => /PDO entry names omitted|PDO categories omitted|DC category/.test(item));
+}
+
+function identityMismatchReasons(slave: SlaveInfo | undefined, document: EsiResult | undefined, device: EsiDevice | undefined): string[] {
+  if (!slave || !document || !device) return [];
+  const reasons: string[] = [];
+  if (slave.identity.vendor_id !== document.vendor_id) reasons.push("Vendor ID 不同");
+  if (slave.identity.product_code !== device.product_code) reasons.push("Product Code 不同");
+  if (slave.identity.revision !== deviceRevision(device)) reasons.push("Revision 不同");
+  return reasons;
+}
 
 function formatHexView(data: string): string {
   const bytes = data.trim().split(/\s+/).filter(Boolean);
   const lines: string[] = [];
   for (let offset = 0; offset < bytes.length; offset += 16) {
-    lines.push(`${offset.toString(16).toUpperCase().padStart(4, "0")}: ${bytes.slice(offset, offset + 16).join(" ")}`);
+    const row = bytes.slice(offset, offset + 16);
+    const hexadecimal = row.join(" ").padEnd(47, " ");
+    const ascii = row.map((item) => {
+      const value = Number.parseInt(item, 16);
+      return value >= 0x20 && value <= 0x7E ? String.fromCharCode(value) : ".";
+    }).join("");
+    lines.push(`${offset.toString(16).toUpperCase().padStart(4, "0")}: ${hexadecimal}  |${ascii.padEnd(16, " ")}|`);
   }
   return lines.join("\n");
 }
@@ -400,7 +584,7 @@ function deviceRevision(device: EsiDevice): number {
   return Number(device.revision ?? device.revision_number ?? 0);
 }
 
-function EepromPage({ slave, status, setProgress, run }: { slave?: SlaveInfo; status: WorkbenchStatus; setProgress: (value?: ProgressState) => void; run: Run }) {
+function EepromPage({ slave, status, progress, setProgress, run }: { slave?: SlaveInfo; status: WorkbenchStatus; progress?: ProgressState; setProgress: (value?: ProgressState) => void; run: Run }) {
   const [esi, setEsi] = useState<EsiResult>();
   const [ordinal, setOrdinal] = useState(0);
   const [target, setTarget] = useState<TargetResult>();
@@ -408,60 +592,90 @@ function EepromPage({ slave, status, setProgress, run }: { slave?: SlaveInfo; st
   const [capacityError, setCapacityError] = useState("");
   const [generationError, setGenerationError] = useState("");
   const [backupPath, setBackupPath] = useState("");
+  const [recentEsi, setRecentEsi] = useState<string[]>(() => {
+    try { return JSON.parse(window.localStorage.getItem(RECENT_ESI_KEY) ?? "[]") as string[]; }
+    catch { return []; }
+  });
   const [readResult, setReadResult] = useState<EepromReadResult>();
   const [operationResult, setOperationResult] = useState<EepromOperationResult>();
+  const generationRequestRef = useRef(0);
+  const autoMatchContextRef = useRef("");
   const currentDevice = esi?.devices[ordinal];
+  const operationInProgress = isEepromOperation(progress?.operation) && progress!.percent < 100;
   const capacityKnown = physicalSize !== undefined && !capacityError;
   const capacityMatches = Boolean(target && capacityKnown && target.size === physicalSize);
-  const identityMismatch = Boolean(slave && currentDevice && (
-    slave.identity.vendor_id !== esi?.vendor_id || slave.identity.product_code !== currentDevice.product_code ||
-    slave.identity.revision !== deviceRevision(currentDevice)
-  ));
-  const canFlash = Boolean(slave && target && capacityMatches && !status.cycle_running && slave.state === 1);
-  const blockers = [!target && "需要选择有效 XML", !capacityKnown && "需要成功读取物理 EEPROM 容量", target && capacityKnown && !capacityMatches && "目标容量与物理 EEPROM 不一致", status.cycle_running && "需要停止周期通信", slave?.state !== 1 && "需要将从站切换到 INIT"].filter(Boolean) as string[];
+  const capacityState = !target ? "uncompared" : !capacityKnown ? "unknown" : capacityMatches ? "matched" : "mismatched";
+  const identityMismatches = identityMismatchReasons(slave, esi, currentDevice);
+  const identityMismatch = identityMismatches.length > 0;
+  const canFlash = Boolean(slave && target && capacityMatches && !status.cycle_running && slave.state === 1 && !operationInProgress);
+  const blockers = [operationInProgress && "已有 EEPROM 操作正在执行", !target && "需要选择有效 XML", !capacityKnown && "需要成功读取物理 EEPROM 容量", target && capacityKnown && !capacityMatches && "目标容量与物理 EEPROM 不一致", status.cycle_running && "需要停止周期通信", slave?.state !== 1 && "需要将从站切换到 INIT"].filter(Boolean) as string[];
   useEffect(() => {
+    let active = true;
     setPhysicalSize(undefined); setCapacityError(""); setReadResult(undefined); setOperationResult(undefined); setBackupPath("");
     if (slave) bridgeRequest<{ size: number }>("eeprom_capacity", { position: slave.position })
-      .then((value) => setPhysicalSize(value.size))
-      .catch((error) => setCapacityError(error instanceof Error ? error.message : String(error)));
-  }, [slave?.position]);
+      .then((value) => { if (active) setPhysicalSize(value.size); })
+      .catch((error) => { if (active) setCapacityError(error instanceof Error ? error.message : String(error)); });
+    return () => { active = false; };
+  }, [slaveIdentityKey(slave)]);
 
   const generate = useCallback(async (document: EsiResult, selectedOrdinal: number) => {
+    const requestId = ++generationRequestRef.current;
     setTarget(undefined); setOperationResult(undefined); setGenerationError("");
     const value = await run(async () => {
       try { return await bridgeRequest<TargetResult>("sii_generate", { document_id: document.document_id, ordinal: selectedOrdinal }); }
-      catch (error) { setGenerationError(error instanceof Error ? error.message : String(error)); throw error; }
+      catch (error) {
+        if (generationRequestRef.current === requestId) setGenerationError(error instanceof Error ? error.message : String(error));
+        throw error;
+      }
     });
-    if (value) setTarget(value);
+    if (value && generationRequestRef.current === requestId) setTarget(value);
   }, [run]);
 
   useEffect(() => {
     if (!slave || !esi) return;
+    const context = `${esi.document_id}:${slaveIdentityKey(slave)}`;
+    if (autoMatchContextRef.current === context) return;
+    autoMatchContextRef.current = context;
     const matched = esi.devices.findIndex((device) =>
       esi.vendor_id === slave.identity.vendor_id && device.product_code === slave.identity.product_code &&
       deviceRevision(device) === slave.identity.revision,
     );
-    if (matched >= 0 && matched !== ordinal) {
+    if (matched >= 0) {
       setOrdinal(matched);
       void generate(esi, matched);
     }
-  }, [esi, generate, ordinal, slave]);
+  }, [esi, generate, slaveIdentityKey(slave)]);
 
-  const selectXml = async () => {
-    const path = await pickFile(["xml"]); if (!path) return;
+  const loadXml = useCallback(async (path: string) => {
     const document = await run(() => bridgeRequest<EsiResult>("esi_load", { path }));
     if (document) {
+      const nextRecent = [path, ...recentEsi.filter((item) => item !== path)].slice(0, 5);
+      setRecentEsi(nextRecent);
+      window.localStorage.setItem(RECENT_ESI_KEY, JSON.stringify(nextRecent));
       const matched = slave ? document.devices.findIndex((device) =>
         document.vendor_id === slave.identity.vendor_id && device.product_code === slave.identity.product_code && deviceRevision(device) === slave.identity.revision,
       ) : -1;
       const selectedOrdinal = matched >= 0 ? matched : 0;
+      autoMatchContextRef.current = slave ? `${document.document_id}:${slaveIdentityKey(slave)}` : "";
       setEsi(document); setOrdinal(selectedOrdinal); await generate(document, selectedOrdinal);
     }
+  }, [generate, recentEsi, run, slaveIdentityKey(slave)]);
+  const selectXml = async () => {
+    const path = await pickFile(["xml"]); if (path) await loadXml(path);
   };
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void onFileDrop((paths) => {
+      const xml = paths.find((path) => path.toLowerCase().endsWith(".xml"));
+      if (xml && !operationInProgress) void loadXml(xml);
+    }).then((value) => { dispose = value; });
+    return () => dispose?.();
+  }, [loadXml, operationInProgress]);
   const changeDevice = async (value: number) => { setOrdinal(value); if (esi) await generate(esi, value); };
   const operation = async <T,>(fn: () => Promise<T>, success: string): Promise<T | undefined> => {
+    if (["eeprom_read", "eeprom_backup", "eeprom_flash", "eeprom_restore"].some((method) => operationStore.active(method))) return undefined;
     setOperationResult(undefined);
-    setProgress({ operation: "eeprom", stage: "准备", completed: 0, total: 100, percent: 0, detail: "正在检查操作条件", tone: "info" });
+    setProgress({ operation: "eeprom", stage: "准备", completed: 0, total: 100, percent: 0, detail: "正在检查操作条件", tone: "info", cancellable: true });
     try {
       const value = await fn();
       const flashPayload = value as EepromFlashPayload;
@@ -483,6 +697,11 @@ function EepromPage({ slave, status, setProgress, run }: { slave?: SlaveInfo; st
       return value;
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
+      if (error instanceof BridgeRequestError && error.code === "CANCELLED") {
+        setProgress({ operation: "eeprom", stage: "已取消", completed: 100, total: 100, percent: 100, detail: text, tone: "info" });
+        setOperationResult({ title: "操作已取消", severity: "info", error: text });
+        return undefined;
+      }
       setProgress({ operation: "eeprom", stage: "操作失败", completed: 100, total: 100, percent: 100, detail: text, tone: "error" });
       setOperationResult({ title: "操作失败", severity: "error", error: text });
       return undefined;
@@ -498,17 +717,22 @@ function EepromPage({ slave, status, setProgress, run }: { slave?: SlaveInfo; st
   const flash = () => slave && target && operation(() => bridgeRequest<EepromFlashPayload>("eeprom_flash", { position: slave.position, target_id: target.target_id, auto_reset: true }), "烧录并校验完成");
 
   return <><PageTitle title="EEPROM" subtitle="ESI 预览、完整读取、BIN 备份与安全烧录" />
+    <Box sx={{ mb: 1.25, p: 1.25, border: "1px dashed", borderColor: "primary.light", borderRadius: 1.5, bgcolor: "rgba(25,118,210,.035)" }}><Stack direction="row" alignItems="center" gap={1} flexWrap="wrap"><Typography variant="body2" fontWeight={700}>可将 ESI XML 拖入窗口</Typography><Typography variant="caption" color="text.secondary">最近文件：</Typography>{recentEsi.length ? recentEsi.map((path) => <Chip key={path} size="small" variant="outlined" disabled={operationInProgress} label={path.split(/[\\/]/).at(-1)} title={path} onClick={() => void loadXml(path)} />) : <Typography variant="caption" color="text.secondary">暂无</Typography>}</Stack></Box>
+    {backupPath && <Alert severity="success" action={<Button size="small" onClick={() => revealPath(backupPath)}>打开位置</Button>} sx={{ mb: 1.25 }}><Typography fontWeight={700}>BIN 备份已保存</Typography><Typography variant="body2" className="mono" sx={{ overflowWrap: "anywhere" }}>{backupPath}</Typography></Alert>}
+    {operationResult?.payload && <Alert severity="info" sx={{ mb: 1.25 }}><Typography variant="body2"><strong>技术详情 · 首个差异：</strong>{operationResult.payload.result.comparison.first_difference === undefined ? "无" : hex(operationResult.payload.result.comparison.first_difference, 4)}</Typography></Alert>}
+    {target?.layout && <Card sx={{ ...cardSx, mb: 1.25 }}><CardContent><Typography variant="h6">Smart View · 目标 SII 布局</Typography><Typography variant="caption" color="text.secondary">类别偏移和长度含类别头；内容最多预览前 32 byte。</Typography><TableContainer sx={{ mt: 1, maxHeight: 260 }}><Table size="small" stickyHeader><TableHead><TableRow><TableCell>类别</TableCell><TableCell>类型</TableCell><TableCell>偏移</TableCell><TableCell>长度</TableCell><TableCell>内容预览</TableCell></TableRow></TableHead><TableBody>{target.layout.map((item) => <TableRow key={`${item.offset}-${item.name}`}><TableCell>{item.name}</TableCell><TableCell className="mono">{item.kind === undefined || item.kind === null ? "—" : hex(item.kind)}</TableCell><TableCell className="mono">{hex(item.offset, 4)}</TableCell><TableCell>{item.length} B</TableCell><TableCell className="mono" sx={{ maxWidth: 420 }}><Typography variant="caption" noWrap title={item.content}>{item.content || "（空）"}</Typography></TableCell></TableRow>)}</TableBody></Table></TableContainer></CardContent></Card>}
+    {progress && isEepromOperation(progress.operation) && <Card sx={{ ...cardSx, mb: 1.25, borderColor: progress.tone === "error" ? "error.main" : progress.tone === "success" ? "success.main" : "primary.main" }}><CardContent sx={{ py: "10px !important" }}><Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}><Box minWidth={0}><Typography fontWeight={700}>{progress.stage}</Typography><Typography variant="caption" color="text.secondary" noWrap>{progress.detail}</Typography></Box><Stack direction="row" alignItems="center" gap={1} sx={{ minWidth: 230 }}><LinearProgress color={progress.tone === "error" ? "error" : progress.tone === "success" ? "success" : "primary"} variant="determinate" value={progress.percent} sx={{ flex: 1, height: 5, borderRadius: 4 }} /><Typography className="mono" variant="caption" sx={{ width: 34, textAlign: "right" }}>{progress.percent}%</Typography>{progress.percent < 100 && progress.cancellable !== false && <Button size="small" onClick={() => bridgeRequest("cancel")}>取消</Button>}</Stack></Stack></CardContent></Card>}
     {!slave ? <EmptyState text="请先选择目标从站" /> : <Stack spacing={1.5}>
-      <Box sx={{ display: "grid", gridTemplateColumns: "minmax(0, 1.05fr) minmax(360px, .95fr)", gap: 1.5 }}>
-        <Card sx={cardSx}><CardContent><Stack direction="row" alignItems="center" justifyContent="space-between"><Box><Typography variant="h6">烧录目标</Typography><Typography color="text.secondary">XML 或 Device 变化时自动生成</Typography></Box><Button variant="outlined" startIcon={<FolderOpenRounded />} onClick={selectXml}>选择 XML</Button></Stack><Divider sx={{ my: 2 }} />
-          {esi ? <Stack spacing={1.5}><TextField label="XML 文件" size="small" value={esi.path} InputProps={{ readOnly: true }} /><FormControl fullWidth size="small"><InputLabel>Device</InputLabel><Select label="Device" value={ordinal} onChange={(e) => changeDevice(Number(e.target.value))}>{esi.devices.map((device, i) => <MenuItem value={i} key={i}>{device.name} · {hex(device.product_code, 8)}</MenuItem>)}</Select></FormControl>{identityMismatch && <Alert severity="warning">当前 XML/Device 身份与目标从站不一致；允许继续生成，但烧录前请确认。</Alert>}{generationError ? <Alert severity="error"><Typography fontWeight={700}>目标生成失败</Typography>{generationError}</Alert> : target ? <Alert severity={target.omitted.length ? "warning" : "success"}>{target.omitted.length ? `目标已生成，并明确省略或降级 ${target.omitted.length} 项；请查看 Smart View。` : "目标已生成，可进入条件检查。"}</Alert> : <Alert severity="info">正在生成 Smart View…</Alert>}</Stack> : <Box sx={{ py: 6, textAlign: "center", color: "text.secondary" }}>选择厂商 ESI XML 后自动解析并生成目标</Box>}
+      <Box sx={{ display: "grid", gridTemplateColumns: "minmax(0, 1.15fr) minmax(320px, .85fr)", gap: 1.25, alignItems: "start" }}>
+        <Card sx={cardSx}><CardContent><Stack direction="row" alignItems="center" justifyContent="space-between"><Box><Typography variant="h6">烧录目标</Typography><Typography color="text.secondary">XML 或 Device 变化时自动生成</Typography></Box><Button disabled={operationInProgress} variant="outlined" startIcon={<FolderOpenRounded />} onClick={selectXml}>选择 XML</Button></Stack><Divider sx={{ my: 2 }} />
+          {esi ? <Stack spacing={1.5}><TextField label="XML 文件" size="small" value={esi.path} InputProps={{ readOnly: true }} /><FormControl disabled={operationInProgress} fullWidth size="small"><InputLabel>Device</InputLabel><Select label="Device" value={ordinal} onChange={(e) => changeDevice(Number(e.target.value))}>{esi.devices.map((device, i) => <MenuItem value={i} key={i}>{device.name} · {hex(device.product_code, 8)}</MenuItem>)}</Select></FormControl>{identityMismatch && <Alert severity="warning">当前 XML/Device 与目标从站不一致：{identityMismatches.join("、")}。身份不匹配仅作警告，不要求额外确认；请自行核对目标是否正确。</Alert>}{generationError ? <Alert severity="error"><Typography fontWeight={700}>目标生成失败</Typography>{generationError}</Alert> : target ? <Alert severity={targetNeedsAttention(target) ? "warning" : "success"}>{targetNeedsAttention(target) ? "目标已生成，但有容量降级或关键类别未写入；请查看 Smart View。" : "目标已生成，容量与完整性由烧录条件继续检查。"}</Alert> : <Alert severity="info">正在生成 Smart View…</Alert>}</Stack> : <Box sx={{ py: 6, textAlign: "center", color: "text.secondary" }}>选择厂商 ESI XML 后自动解析并生成目标</Box>}
         </CardContent></Card>
         <Card sx={cardSx}><CardContent><Typography variant="h6">Smart View</Typography><Typography color="text.secondary">随当前 XML 和 Device 实时更新</Typography><Divider sx={{ my: 2 }} />
-          {currentDevice && target ? <Stack spacing={1.5}><Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1.5 }}>{[["设备", currentDevice.name], ["厂商", esi?.vendor_name], ["Product Code", hex(currentDevice.product_code, 8)], ["Revision", hex(deviceRevision(currentDevice), 8)], ["目标容量", `${target.size} B`], ["物理容量", capacityError ? "读取失败" : physicalSize === undefined ? "读取中…" : `${physicalSize} B`], ["SHA-256", target.sha256]].map(([label, value]) => <Box key={String(label)}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={String(label).includes("Code") || label === "SHA-256" ? "mono" : ""} noWrap title={String(value)}>{value}</Typography></Box>)}</Box>{capacityError && <Alert severity="error">{capacityError}</Alert>}<Divider /><Box><Typography variant="subtitle2">已转换内容</Typography><Stack direction="row" flexWrap="wrap" gap={0.7} sx={{ mt: 1 }}>{target.supported.map((item) => <Chip size="small" color="success" variant="outlined" label={item} key={item} />)}</Stack></Box>{target.omitted.length > 0 && <Box><Typography variant="subtitle2" color="warning.main">未转换或容量降级内容</Typography>{target.omitted.map((item) => <Typography variant="body2" color="warning.main" key={item}>• {item}</Typography>)}</Box>}</Stack> : <Box sx={{ py: 6, textAlign: "center", color: "text.secondary" }}>尚无可预览的烧录目标</Box>}
+          {currentDevice && target ? <Stack spacing={1.5}><Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1.5 }}>{[["设备", currentDevice.name], ["厂商", esi?.vendor_name], ["Product Code（产品代码）", hex(currentDevice.product_code, 8)], ["Revision（修订版本）", hex(deviceRevision(currentDevice), 8)], ["目标容量", `${target.size} B`], ["物理容量", capacityError ? "读取失败" : physicalSize === undefined ? "读取中…" : `${physicalSize} B`], ["SHA-256", target.sha256]].map(([label, value]) => <Box key={String(label)}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={String(label).includes("Code") || label === "SHA-256" ? "mono" : ""} noWrap title={String(value)}>{value}</Typography></Box>)}</Box>{capacityError && <Alert severity="error">{capacityError}</Alert>}<Divider /><Box><Typography variant="subtitle2">已转换内容</Typography><Stack direction="row" flexWrap="wrap" gap={0.7} sx={{ mt: 1 }}>{target.supported.map((item) => <Chip size="small" color="success" variant="outlined" label={item} key={item} />)}</Stack></Box>{target.omitted.length > 0 && <Box><Typography variant="subtitle2" color={targetNeedsAttention(target) ? "warning.main" : "text.primary"}>{targetNeedsAttention(target) ? "容量降级或未写入类别" : "转换范围说明"}</Typography>{target.omitted.map((item) => <Typography variant="body2" color={targetNeedsAttention(target) ? "warning.main" : "text.secondary"} key={item}>• {item}</Typography>)}</Box>}</Stack> : <Box sx={{ py: 6, textAlign: "center", color: "text.secondary" }}>尚无可预览的烧录目标</Box>}
         </CardContent></Card>
       </Box>
-      <Card sx={cardSx}><CardContent><Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}><Box><Typography variant="h6">读取与恢复</Typography><Typography color="text.secondary" sx={{ mb: 2 }}>“完整读取”仅刷新 Smart/Hex View；“备份 BIN”读取后直接保存可恢复文件。读取进度显示在右下角通知中。</Typography><Stack direction="row" gap={1} flexWrap="wrap"><Tooltip title={status.cycle_running ? "完整读取前必须停止周期通信" : ""}><span><Button variant="outlined" disabled={status.cycle_running} onClick={readFull}>完整读取</Button></span></Tooltip><Tooltip title={status.cycle_running ? "备份前必须停止周期通信" : ""}><span><Button variant="outlined" disabled={status.cycle_running} startIcon={<SaveAltRounded />} onClick={backup}>备份 BIN</Button></span></Tooltip><Tooltip title={status.cycle_running || slave.state !== 1 ? "恢复前必须停止周期通信并切换到 INIT" : ""}><span><Button color="warning" variant="outlined" disabled={status.cycle_running || slave.state !== 1} onClick={restore}>从 BIN 恢复</Button></span></Tooltip>{backupPath && <Button onClick={() => revealPath(backupPath)} startIcon={<FolderOpenRounded />}>打开备份位置</Button>}</Stack></Box><Box><Typography variant="h6">烧录条件</Typography><Stack direction="row" gap={0.8} flexWrap="wrap" sx={{ my: 1.5 }}><Chip color={target ? "success" : "default"} label={target ? "目标已生成" : "缺少目标"} /><Chip color={capacityMatches ? "success" : "warning"} label={!capacityKnown ? "容量未知" : capacityMatches ? "容量一致" : "容量不一致"} /><Chip color={!status.cycle_running ? "success" : "warning"} label={!status.cycle_running ? "周期已停止" : "周期运行中"} /><Chip color={slave.state === 1 ? "success" : "warning"} label={slave.state === 1 ? "从站 INIT" : `当前 ${stateLabel(slave.state)}`} /></Stack><Tooltip title={blockers.join("；")}><span><Button variant="contained" color="warning" disabled={!canFlash} startIcon={<MemoryRounded />} onClick={flash}>烧录</Button></span></Tooltip>{blockers.length > 0 && <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>{blockers.join("；")}</Typography>}</Box></Box></CardContent></Card>
-      {readResult && <Card sx={cardSx}><CardContent><Typography variant="h6">最近完整读取</Typography><Box sx={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 1.5, mt: 1.5 }}>{[["读取时间", new Date(readResult.read_at).toLocaleString()], ["容量", `${readResult.size} B`], ["SII 结构", readResult.sii_valid ? `${readResult.category_count ?? 0} 个 Category` : "无效"], ["差异", readResult.comparison ? `${readResult.comparison.differing_bytes} byte` : "未选择目标"], ["Vendor ID", readResult.identity ? hex(readResult.identity.vendor_id, 8) : "—"], ["Product Code", readResult.identity ? hex(readResult.identity.product_code, 8) : "—"], ["Revision", readResult.identity ? hex(readResult.identity.revision, 8) : "—"], ["SHA-256", readResult.sha256]].map(([label, value]) => <Box key={label}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={label === "SHA-256" || label.includes("Code") ? "mono" : ""} noWrap title={value}>{value}</Typography></Box>)}</Box>{!readResult.sii_valid && <Alert severity="warning" sx={{ mt: 1.5 }}>原始 BIN 已完整读取，但 SII 解析失败：{readResult.sii_error}</Alert>}<Accordion disableGutters sx={{ mt: 1.5 }}><AccordionSummary expandIcon={<ExpandMoreRounded />}><Typography fontWeight={700}>Hex View（只读）</Typography></AccordionSummary><AccordionDetails><Box component="pre" className="mono" sx={{ m: 0, p: 1.5, bgcolor: "#F6F8FC", borderRadius: 1, maxHeight: 360, overflow: "auto", fontSize: 12 }}>{formatHexView(readResult.data)}</Box></AccordionDetails></Accordion></CardContent></Card>}
+      <Card sx={cardSx}><CardContent><Box sx={{ display: "grid", gridTemplateColumns: "minmax(0, 1.15fr) minmax(300px, .85fr)", gap: 2, alignItems: "start" }}><Box><Typography variant="h6">读取与恢复</Typography><Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.25 }}>完整读取只刷新 Smart/Hex View；备份 BIN 会保存可恢复文件。</Typography><Stack direction="row" gap={0.75} flexWrap="wrap"><Tooltip title={status.cycle_running ? "完整读取前必须停止周期通信" : ""}><span><Button size="small" variant="outlined" disabled={status.cycle_running || operationInProgress} onClick={readFull}>完整读取</Button></span></Tooltip><Tooltip title={status.cycle_running ? "备份前必须停止周期通信" : ""}><span><Button size="small" variant="outlined" disabled={status.cycle_running || operationInProgress} startIcon={<SaveAltRounded />} onClick={backup}>备份 BIN</Button></span></Tooltip><Tooltip title={status.cycle_running || slave.state !== 1 ? "恢复前必须停止周期通信并切换到 INIT" : ""}><span><Button size="small" color="warning" variant="outlined" disabled={status.cycle_running || slave.state !== 1 || operationInProgress} onClick={restore}>从 BIN 恢复</Button></span></Tooltip>{backupPath && <Button size="small" onClick={() => revealPath(backupPath)} startIcon={<FolderOpenRounded />}>打开备份位置</Button>}</Stack></Box><Box sx={{ borderLeft: { sm: 1 }, borderColor: "divider", pl: { sm: 2 } }}><Typography variant="h6">烧录条件</Typography><Stack direction="row" gap={0.6} flexWrap="wrap" sx={{ my: 1 }}><Chip color={target ? "success" : "default"} label={target ? "目标已生成" : "缺少目标"} /><Chip color={capacityState === "matched" ? "success" : capacityState === "uncompared" ? "default" : "warning"} label={{ uncompared: "容量未比对", unknown: "容量未知", matched: "容量一致", mismatched: "容量不一致" }[capacityState]} /><Chip color={!status.cycle_running ? "success" : "warning"} label={!status.cycle_running ? "周期已停止" : "周期运行中"} /><Chip color={slave.state === 1 ? "success" : "warning"} label={slave.state === 1 ? "从站 INIT" : `当前 ${stateLabel(slave.state)}`} /></Stack><Tooltip title={blockers.join("；")}><span><Button size="small" variant="contained" color="error" disabled={!canFlash} startIcon={<MemoryRounded />} onClick={flash}>烧录</Button></span></Tooltip>{blockers.length > 0 && <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>{blockers.join("；")}</Typography>}</Box></Box></CardContent></Card>
+      {readResult && <Card sx={cardSx}><CardContent><Typography variant="h6">最近完整读取</Typography><Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 1.25, mt: 1.25 }}>{[["读取时间", new Date(readResult.read_at).toLocaleString()], ["容量", `${readResult.size} B`], ["SII 结构", readResult.sii_valid ? `${readResult.category_count ?? 0} 个 Category` : "无效"], ["差异", readResult.comparison ? `${readResult.comparison.differing_bytes} byte` : "未选择目标"], ["Vendor ID（厂商 ID）", readResult.identity ? hex(readResult.identity.vendor_id, 8) : "—"], ["Product Code（产品代码）", readResult.identity ? hex(readResult.identity.product_code, 8) : "—"], ["Revision（修订版本）", readResult.identity ? hex(readResult.identity.revision, 8) : "—"], ["SHA-256", readResult.sha256]].map(([label, value]) => <Box key={label} minWidth={0}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={label === "SHA-256" || label.includes("Code") ? "mono" : ""} noWrap title={value}>{value}</Typography></Box>)}</Box>{!readResult.sii_valid && <Alert severity="warning" sx={{ mt: 1.25 }}>原始 BIN 已完整读取，但 SII 解析失败：{readResult.sii_error}</Alert>}<Accordion disableGutters sx={{ mt: 1.25 }}><AccordionSummary expandIcon={<ExpandMoreRounded />}><Typography fontWeight={700}>Hex View（只读）</Typography></AccordionSummary><AccordionDetails><Box component="pre" className="mono data-surface" sx={{ m: 0, p: 1.25, maxHeight: 320, overflow: "auto", fontSize: 12 }}>{formatHexView(readResult.data)}</Box></AccordionDetails></Accordion></CardContent></Card>}
       {operationResult && <Card sx={cardSx}><CardContent><Alert severity={operationResult.severity}><Typography fontWeight={700}>{operationResult.title}</Typography>{operationResult.error ?? operationResult.payload?.result.image_verification}</Alert>{operationResult.payload && <Accordion disableGutters sx={{ mt: 1.2 }}><AccordionSummary expandIcon={<ExpandMoreRounded />}><Typography fontWeight={700}>技术详情</Typography></AccordionSummary><AccordionDetails><Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1 }}>{[["写入 Word", operationResult.payload.result.words_written], ["完整回读", `${operationResult.payload.result.bytes_read_back} B`], ["差异字节", operationResult.payload.result.comparison.differing_bytes], ["目标 SHA-256", operationResult.payload.result.comparison.target_sha256], ["回读 SHA-256", operationResult.payload.result.comparison.readback_sha256], ["SII 结构", operationResult.payload.result.sii_valid ? "通过" : "失败"], ["XML 语义", operationResult.payload.result.semantic_valid ? "通过" : "失败"], ["RES 序列", operationResult.payload.result.reset_sequence?.every(Boolean) ? "三帧成功" : "未完成"], ["重新发现", operationResult.payload.result.rediscovered === undefined ? "未执行" : operationResult.payload.result.rediscovered ? "成功" : "失败"], ["重新加载复核", operationResult.payload.result.reload_verified === undefined ? "未执行" : operationResult.payload.result.reload_verified ? "成功" : "失败"]].map(([label, value]) => <Box key={String(label)}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={String(label).includes("SHA") ? "mono" : ""} noWrap title={String(value)}>{String(value)}</Typography></Box>)}</Box></AccordionDetails></Accordion>}</CardContent></Card>}
     </Stack>}</>;
 }
@@ -516,38 +740,67 @@ function EepromPage({ slave, status, setProgress, run }: { slave?: SlaveInfo; st
 export default function App() {
   const requestedPage = new URLSearchParams(window.location.search).get("page") as PageKey | null;
   const [page, setPage] = useState<PageKey>(pages.some((item) => item.key === requestedPage) ? requestedPage! : "overview");
-  const [status, setStatus] = useState<WorkbenchStatus>({ mode: "real", connected: false, cycle_running: false, slaves: [] });
+  const [status, setStatus] = useState<WorkbenchStatus>({ host_generation: 0, mode: "real", phase: "disconnected", connected: false, cycle_running: false, slaves: [], session_id: 0, revision: 0 });
   const [adapters, setAdapters] = useState<AdapterInfo[]>([]);
   const [adapter, setAdapter] = useState("");
   const [selectedPosition, setSelectedPosition] = useState<number>();
   const [snapshot, setSnapshot] = useState<Snapshot>();
-  const [busy, setBusy] = useState(false);
-  const [autoScanning, setAutoScanning] = useState(true);
+  const [bridgeAvailable, setBridgeAvailable] = useState(true);
+  const [bridgeExit, setBridgeExit] = useState<BridgeExitInfo>();
   const [message, setMessage] = useState<{ text: string; severity: "success" | "error" | "info" }>();
   const [settings, setSettings] = useState(false);
   const [settingsTab, setSettingsTab] = useState(0);
+  const [alLanguage, setAlLanguage] = useState<AlStatusLanguage>(() => window.localStorage.getItem(AL_LANGUAGE_KEY) === "en" ? "en" : "zh");
   const [slaveContextMenu, setSlaveContextMenu] = useState<SlaveContextMenu>();
   const [progress, setProgress] = useState<ProgressState>();
+  const [registerProfileOverrides, setRegisterProfileOverrides] = useState<Record<string, string>>({});
+  const appliedClockRef = useRef<{ hostGeneration: number; sessionId: number } | undefined>(undefined);
   const slave = status.slaves.find((item) => item.position === selectedPosition);
+  const selectedSlaveKey = slaveIdentityKey(slave);
+  const registerProfile = slave ? registerProfileOverrides[selectedSlaveKey] ?? defaultRegisterProfile(slave.chip_model) : "ET1100";
+  const operations = useSyncExternalStore(operationStore.subscribe, operationStore.snapshot);
+  const busy = useMemo(() => [...operations.values()].some((operation) =>
+    ["queued", "running"].includes(operation.phase) && operation.lane === "hardware" && operation.method !== "register_watch"
+  ), [operations]);
+  const eepromExclusive = isEepromOperation(progress?.operation) && progress!.percent < 100;
+
+  useEffect(() => subscribeBusSnapshot((next) => {
+    const previousClock = appliedClockRef.current;
+    const sessionChanged = previousClock !== undefined && (
+      previousClock.hostGeneration !== next.host_generation
+      || previousClock.sessionId !== next.session_id
+    );
+    appliedClockRef.current = {
+      hostGeneration: next.host_generation,
+      sessionId: next.session_id,
+    };
+    setStatus(next);
+    setSelectedPosition((current) => current !== undefined && next.slaves.some((item) => item.position === current)
+      ? current
+      : next.slaves[0]?.position);
+    if (sessionChanged) {
+      setSnapshot(undefined);
+      setRegisterProfileOverrides({});
+    }
+  }), []);
 
   const refresh = useCallback(async () => {
-    const next = await bridgeRequest<WorkbenchStatus>("status");
-    setStatus(next);
-    if (next.slaves.length && !next.slaves.some((item) => item.position === selectedPosition)) setSelectedPosition(next.slaves[0].position);
-  }, [selectedPosition]);
+    await bridgeRequest<WorkbenchStatus>("status");
+  }, []);
 
   const run: Run = useCallback(async (operation, success) => {
-    setBusy(true);
     try {
       const result = await operation();
       if (success) setMessage({ text: success, severity: "success" });
       return result;
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
-      setMessage({ text, severity: "error" });
+      const cancelled = error instanceof BridgeRequestError && error.code === "CANCELLED";
+      setMessage({ text: cancelled ? `已取消：${text}` : text, severity: cancelled ? "info" : "error" });
+      if (cancelled) return undefined;
       setProgress((previous) => previous ? { ...previous, stage: "操作失败", detail: text, tone: "error" } : previous);
       return undefined;
-    } finally { setBusy(false); }
+    }
   }, []);
 
   const refreshStates = useCallback(async () => {
@@ -555,12 +808,8 @@ export default function App() {
       await refresh();
       return;
     }
-    const slaves = await bridgeRequest<SlaveInfo[]>("read_states");
-    setStatus((current) => ({ ...current, slaves }));
-    if (slaves.length && !slaves.some((item) => item.position === selectedPosition)) {
-      setSelectedPosition(slaves[0].position);
-    }
-  }, [refresh, selectedPosition, status.connected, status.slaves.length]);
+    await bridgeRequest<SlaveInfo[]>("read_states");
+  }, [refresh, status.connected, status.slaves.length]);
 
   useEffect(() => {
     const disableBrowserContextMenu = (event: MouseEvent) => event.preventDefault();
@@ -571,39 +820,55 @@ export default function App() {
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
-    setBusy(true);
-    const preferredAdapter = window.localStorage.getItem(PREFERRED_ADAPTER_KEY) ?? "";
-    bridgeRequest<AutoScanResult>("auto_scan", { preferred_adapter: preferredAdapter })
+    let unlistenExit: (() => void) | undefined;
+    const bootstrap = () => bridgeRequest<WorkbenchStatus>("status")
       .then((result) => {
         if (!active) return;
-        setAdapters(result.adapters);
-        setAdapter(result.selected_adapter);
-        setStatus((current) => ({
-          ...current,
-          connected: result.connected,
-          cycle_running: false,
-          slaves: result.slaves,
-        }));
-        setSelectedPosition(result.slaves[0]?.position);
-        if (!result.slaves.length) {
-          const failed = result.attempts.filter((attempt) => attempt.error);
-          const text = !result.adapters.length
-            ? "未发现可用网卡，请检查 Npcap 和网卡状态。"
-            : failed.length === result.attempts.length && failed[0]?.error
-              ? `自动扫描失败：${failed[0].error}`
-              : `已扫描 ${result.attempts.length} 个网卡，未发现 EtherCAT 从站。`;
-          setMessage({ text, severity: failed.length === result.attempts.length && failed.length > 0 ? "error" : "info" });
-        }
+        return result;
       })
       .catch((error) => {
-        if (active) setMessage({ text: error instanceof Error ? error.message : String(error), severity: "error" });
+        if (!active) return;
+        const text = error instanceof Error ? error.message : String(error);
+        if (/Python EtherCAT|桥接通信|桥接进程/.test(text)) {
+          setBridgeAvailable(false);
+          setSelectedPosition(undefined);
+        }
+        setMessage({ text, severity: "error" });
       })
       .finally(() => {
-        if (active) { setAutoScanning(false); setBusy(false); }
       });
-    onBridgeEvent((event: BridgeEvent) => {
-      if (["slaves_changed", "cycle_started", "cycle_stopped"].includes(event.kind)) setStatus((current) => ({ ...current, cycle_running: event.kind === "cycle_started" ? true : event.kind === "cycle_stopped" ? false : current.cycle_running, slaves: event.data as SlaveInfo[] }));
-      if (event.kind === "cycle_fault") { setStatus((current) => ({ ...current, cycle_running: false })); setMessage({ text: String(event.data), severity: "error" }); }
+    const eventReady = onBridgeEvent((event: BridgeEvent) => {
+      if (["ready", "host_ready"].includes(event.kind)) {
+        setBridgeAvailable(true);
+        setBridgeExit(undefined);
+        setMessage((current) => current?.text.includes("通信核心") ? undefined : current);
+        if (event.kind === "host_ready") {
+          void bridgeRequest<WorkbenchStatus>("status").catch((error) => {
+            const text = error instanceof Error ? error.message : String(error);
+            setMessage({ text, severity: "error" });
+          });
+        }
+      }
+      if (event.kind === "host_restart_failed") {
+        const data = event.data as { message?: string };
+        setBridgeAvailable(false);
+        setMessage({ text: `通信核心启动失败：${data.message ?? "未知错误"}；监督器将在后台重试。`, severity: "error" });
+      }
+      if (event.kind === "heartbeat") {
+        // Heartbeat is telemetry only. Command responses and bus_snapshot events
+        // are the authoritative source of EtherCAT session and state.
+      }
+      if (event.kind === "cycle_fault") setMessage({ text: cycleFaultMessage(event.data), severity: "error" });
+      if (event.kind === "worker_fatal") {
+        const text = typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+        setBridgeAvailable(false);
+        operationStore.invalidate("WORKER_FATAL", text);
+        setSelectedPosition(undefined);
+        setSnapshot(undefined);
+        setRegisterProfileOverrides({});
+        setProgress((previous) => previous && previous.percent < 100 ? { ...previous, completed: previous.total, percent: 100, stage: "通信 Worker 已停止", detail: text, tone: "error", cancellable: false } : previous);
+        setMessage({ text: `EtherCAT Worker 无法启动或已停止：${text}`, severity: "error" });
+      }
       if (event.kind === "process_data") setSnapshot(event.data as Snapshot);
       if (event.kind === "progress") {
         const next = event.data as OperationProgress;
@@ -625,29 +890,57 @@ export default function App() {
         });
       }
       if (event.kind === "error") setMessage({ text: event.data instanceof Error ? event.data.message : typeof event.data === "string" ? event.data : JSON.stringify(event.data), severity: "error" });
-    }).then((value) => { unlisten = value; });
-    return () => { active = false; unlisten?.(); };
+    }).then((value) => { if (active) unlisten = value; else value(); });
+    const exitReady = onBridgeExited((info) => {
+      if (!active) return;
+      setBridgeAvailable(false);
+      setBridgeExit(info);
+      operationStore.invalidate("PROCESS_EXITED", info.message);
+      setProgress((previous) => previous && previous.percent < 100 ? {
+        ...previous,
+        completed: previous.total,
+        percent: 100,
+        stage: "通信核心已退出",
+        detail: info.last_method ? `${info.message}；最后操作：${info.last_method}` : info.message,
+        tone: "error",
+        cancellable: false,
+      } : previous);
+      setSelectedPosition(undefined);
+      setSnapshot(undefined);
+      setRegisterProfileOverrides({});
+      const detail = info.stderr_tail?.trim().split(/\r?\n/).at(-1);
+      setMessage({ text: `${info.message}${detail ? `：${detail}` : ""}。通信核心将以未连接状态重建；写操作结果未知时请先重新读取设备。`, severity: "error" });
+    }).then((value) => { if (active) unlistenExit = value; else value(); });
+    Promise.all([eventReady, exitReady]).then(() => { if (active) bootstrap(); });
+    return () => { active = false; unlisten?.(); unlistenExit?.(); };
   }, []);
 
   const connect = async () => {
-    if (status.connected) await run(() => bridgeRequest("disconnect").then((value) => { setSelectedPosition(undefined); setSnapshot(undefined); return value; }), "已断开网卡");
+    if (status.connected) await run(() => bridgeRequest("disconnect"), "已断开网卡");
     else await run(() => bridgeRequest("connect", { adapter }), "网卡已连接");
-    await refresh();
+  };
+  const enumerateAdapters = async () => {
+    const items = await run(() => bridgeRequest<AdapterInfo[]>("enumerate_adapters"));
+    if (!items) return;
+    const ordered = orderAdapters(items);
+    const preferred = window.localStorage.getItem(PREFERRED_ADAPTER_KEY) ?? "";
+    setAdapters(ordered);
+    setAdapter(ordered.some((item) => item.name === preferred) ? preferred : ordered[0]?.name ?? "");
+    if (!items.length) setMessage({ text: "未发现可用网卡，请检查 Npcap 和网卡状态。", severity: "info" });
   };
   const scan = async () => {
-    const found = await run(() => bridgeRequest<SlaveInfo[]>("scan"), "扫描完成");
-    if (found) { setStatus((current) => ({ ...current, slaves: found })); setSelectedPosition(found[0]?.position); }
+    const found = await run(() => bridgeRequest<SlaveInfo[]>("scan"));
+    if (found) setMessage({ text: found.length ? `扫描完成，发现 ${found.length} 个从站` : "扫描完成，但未发现从站。请检查网卡、链路和从站供电。", severity: found.length ? "success" : "info" });
   };
   const switchMode = async (demo: boolean) => {
     const mode = demo ? "demo" : "real";
     const changed = await run(() => bridgeRequest("switch_mode", { mode }), demo ? "已切换到 Demo 模式" : "已切换到实际设备");
     if (changed) {
-      setStatus({ mode, connected: false, cycle_running: false, slaves: [] });
-      setSelectedPosition(undefined);
       const items = await bridgeRequest<AdapterInfo[]>("enumerate_adapters");
+      const ordered = orderAdapters(items);
       const preferred = window.localStorage.getItem(PREFERRED_ADAPTER_KEY) ?? "";
-      setAdapters(items);
-      setAdapter(items.some((item) => item.name === preferred) ? preferred : items[0]?.name ?? "");
+      setAdapters(ordered);
+      setAdapter(ordered.some((item) => item.name === preferred) ? preferred : ordered[0]?.name ?? "");
     }
   };
 
@@ -655,6 +948,14 @@ export default function App() {
     setAdapter(value);
     window.localStorage.setItem(PREFERRED_ADAPTER_KEY, value);
   };
+
+  const navigate = useCallback((nextPage: PageKey) => {
+    if (nextPage === page) return;
+    // Advance before rendering the target page so its initial bridge calls are
+    // born into the new page generation instead of being cancelled immediately.
+    operationStore.nextPage();
+    setPage(nextPage);
+  }, [page]);
 
   const openSlaveContextMenu = (event: ReactMouseEvent, position: number) => {
     event.preventDefault();
@@ -667,7 +968,7 @@ export default function App() {
   const openSlaveEeprom = () => {
     if (slaveContextMenu) setSelectedPosition(slaveContextMenu.position);
     setSlaveContextMenu(undefined);
-    setPage("eeprom");
+    navigate("eeprom");
   };
 
   const visit = (url: string) => {
@@ -679,44 +980,45 @@ export default function App() {
 
   const content = useMemo(() => {
     const props = { slave, run };
-    if (page === "overview") return <OverviewPage {...props} slaves={status.slaves} refresh={refreshStates} />;
-    if (page === "registers") return <RegistersPage {...props} />;
-    return <EepromPage {...props} status={status} setProgress={setProgress} />;
-  }, [page, slave, status, snapshot, progress, refreshStates, run]);
+    if (page === "overview") return <OverviewPage {...props} status={status} busy={busy} slaves={status.slaves} refresh={refreshStates} registerProfile={registerProfile} alLanguage={alLanguage} onRegisterProfileChange={(profile) => slave && setRegisterProfileOverrides((current) => ({ ...current, [selectedSlaveKey]: profile }))} />;
+    if (page === "registers") return <RegistersPage {...props} registerProfile={registerProfile} />;
+    return <EepromPage {...props} status={status} progress={progress} setProgress={setProgress} />;
+  }, [page, registerProfile, selectedSlaveKey, selectedPosition, slave, status, snapshot, progress, refreshStates, run, busy, alLanguage]);
 
   return <Box sx={{ display: "flex", height: "100vh", bgcolor: "background.default" }}>
-    <Drawer variant="permanent" PaperProps={{ sx: { width: 190, borderRight: 1, borderColor: "divider", bgcolor: "#FBFCFE", overflow: "hidden" } }}>
-      <Toolbar sx={{ minHeight: "60px !important", px: "14px !important", gap: 1.2 }}>
+    <Drawer variant="permanent" PaperProps={{ sx: { width: 148, borderRight: 1, borderColor: "divider", bgcolor: "#FBFCFE", overflow: "hidden" } }}>
+      <Toolbar sx={{ minHeight: "54px !important", px: "10px !important", gap: 0.75 }}>
         <Box sx={{ width: 34, height: 34, borderRadius: 1.2, bgcolor: "primary.main", color: "white", display: "grid", placeItems: "center", flexShrink: 0 }}><CableRounded fontSize="small" /></Box>
-        <Box minWidth={0}><Typography fontWeight={760} lineHeight={1.1}>EtherCAT</Typography><Typography variant="caption" color="text.secondary">Workbench</Typography></Box>
+        <Box minWidth={0}><Typography fontWeight={760} fontSize={13} lineHeight={1.1}>EtherCAT</Typography><Typography variant="caption" fontSize={10.5} color="text.secondary">Workbench</Typography></Box>
       </Toolbar>
       <Divider />
-      <Typography variant="overline" color="text.secondary" sx={{ px: 2, pt: 1.5 }}>工作区</Typography>
-      <List sx={{ px: 1, pt: 0.5 }}>{pages.map((item) => <ListItemButton selected={page === item.key} onClick={() => setPage(item.key)} key={item.key} sx={{ minHeight: 44, mb: 0.5, px: 1.3 }}><ListItemIcon sx={{ minWidth: 36 }}>{item.icon}</ListItemIcon><ListItemText primary={item.label} primaryTypographyProps={{ fontWeight: 650, fontSize: 14 }} /></ListItemButton>)}</List>
+      <Typography variant="overline" color="text.secondary" sx={{ px: 1.25, pt: 1.1 }}>工作区</Typography>
+      <List sx={{ px: 0.6, pt: 0.3 }}>{pages.map((item) => <ListItemButton disabled={eepromExclusive && item.key !== "eeprom"} selected={page === item.key} onClick={() => navigate(item.key)} key={item.key} sx={{ minHeight: 36, mb: 0.3, px: 0.85 }}><ListItemIcon sx={{ minWidth: 28 }}>{item.icon}</ListItemIcon><ListItemText primary={item.label} primaryTypographyProps={{ fontWeight: 650, fontSize: 13 }} /></ListItemButton>)}</List>
       <Box sx={{ flexGrow: 1 }} />
       <Divider />
-      <List sx={{ p: 1 }}><ListItemButton onClick={() => { setSettingsTab(0); setSettings(true); }} sx={{ minHeight: 42, px: 1.3 }}><ListItemIcon sx={{ minWidth: 36 }}><SettingsRounded /></ListItemIcon><ListItemText primary="设置" primaryTypographyProps={{ fontWeight: 650, fontSize: 14 }} /></ListItemButton></List>
+      <List sx={{ p: 0.6 }}><ListItemButton onClick={() => { setSettingsTab(0); setSettings(true); }} sx={{ minHeight: 36, px: 0.85 }}><ListItemIcon sx={{ minWidth: 28 }}><SettingsRounded /></ListItemIcon><ListItemText primary="设置" primaryTypographyProps={{ fontWeight: 650, fontSize: 13 }} /></ListItemButton></List>
     </Drawer>
-    <Box sx={{ ml: "190px", flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+    <Box sx={{ ml: "148px", flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
       <AppBar position="static" color="inherit" elevation={0} sx={{ borderBottom: 1, borderColor: "divider", bgcolor: "rgba(255,255,255,.96)" }}>
-        <Toolbar sx={{ minHeight: "60px !important", gap: 1, px: "18px !important" }}>
+        <Toolbar sx={{ minHeight: "54px !important", gap: 0.8, px: "14px !important" }}>
           <Stack sx={{ mr: "auto", minWidth: 170 }} spacing={0.15}>
             <Stack direction="row" gap={0.8} alignItems="center">
-              <Chip size="small" color={autoScanning ? "primary" : status.connected ? "success" : "default"} variant={status.connected ? "filled" : "outlined"} label={autoScanning ? "正在自动扫描" : status.connected ? "已连接" : "未连接"} />
+              <Chip size="small" color={!bridgeAvailable ? "error" : status.connected ? "success" : "default"} variant={status.connected ? "filled" : "outlined"} label={!bridgeAvailable ? "通信核心不可用" : status.connected ? "已连接" : "未连接"} />
               {status.mode === "demo" && <Chip size="small" color="warning" label="Demo" />}
               {previewMode && <Chip size="small" variant="outlined" label="预览" />}
             </Stack>
-            <Typography variant="caption" color="text.secondary">{autoScanning ? "正在按优先级检查所有网卡…" : status.connected ? `已发现 ${status.slaves.length} 个从站` : "可手动选择网卡后连接"}</Typography>
+            <Typography variant="caption" color="text.secondary">{!bridgeAvailable ? "通信核心正在恢复" : status.connected ? `已发现 ${status.slaves.length} 个从站` : "先检测网卡，再手动连接和扫描"}</Typography>
           </Stack>
-          <FormControl size="small" sx={{ width: { xs: 270, xl: 330 } }}><InputLabel>网卡</InputLabel><Select label="网卡" value={adapter} disabled={status.connected || autoScanning} onChange={(e) => selectAdapter(e.target.value)}>{adapters.map((item) => <MenuItem value={item.name} key={item.name}>{item.description || item.name}</MenuItem>)}</Select></FormControl>
-          <Button size="small" variant={status.connected ? "outlined" : "contained"} color={status.connected ? "error" : "primary"} startIcon={<UsbRounded />} disabled={autoScanning || busy || (!status.connected && !adapter)} onClick={connect}>{status.connected ? "断开" : "连接"}</Button>
-          <Button size="small" variant="outlined" startIcon={<RefreshRounded />} disabled={autoScanning || busy || !status.connected || status.cycle_running} onClick={scan}>扫描</Button>
+          <Button size="small" variant="outlined" startIcon={<RefreshRounded />} disabled={!bridgeAvailable || eepromExclusive || busy || status.connected} onClick={enumerateAdapters}>检测网卡</Button>
+          <FormControl size="small" sx={{ width: { xs: 240, xl: 300 } }}><InputLabel>网卡</InputLabel><Select label="网卡" value={adapter} disabled={!bridgeAvailable || eepromExclusive || status.connected || busy} onChange={(e) => selectAdapter(e.target.value)}>{adapters.map((item) => <MenuItem value={item.name} key={item.name}>{item.description || item.name}</MenuItem>)}</Select></FormControl>
+          <Button size="small" variant={status.connected ? "outlined" : "contained"} color={status.connected ? "error" : "primary"} startIcon={<UsbRounded />} disabled={!bridgeAvailable || eepromExclusive || busy || (!status.connected && !adapter)} onClick={connect}>{status.connected ? "断开" : "连接"}</Button>
+          <Button size="small" variant="outlined" startIcon={<RefreshRounded />} disabled={!bridgeAvailable || eepromExclusive || busy || !status.connected || status.cycle_running} onClick={scan}>扫描</Button>
           {busy && <CircularProgress size={20} sx={{ ml: 0.5 }} />}
         </Toolbar>
       </AppBar>
       <Box sx={{ display: "flex", minHeight: 0, flex: 1 }}>
-        {status.slaves.length > 0 && <Box component="aside" sx={{ width: { xs: 228, xl: 246 }, flexShrink: 0, bgcolor: "background.paper", borderRight: 1, borderColor: "divider", overflow: "auto", p: 1 }}><Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ px: 1, py: 0.7 }}><Typography variant="overline" color="text.secondary">从站 · {status.slaves.length}</Typography><Chip size="small" variant="outlined" label={status.cycle_running ? "周期运行" : "周期停止"} /></Stack><List dense sx={{ pt: 0.5 }}>{status.slaves.map((item) => <ListItemButton key={item.position} selected={item.position === selectedPosition} onClick={() => setSelectedPosition(item.position)} onContextMenu={(event) => openSlaveContextMenu(event, item.position)} sx={{ mb: 0.4, py: 0.8, px: 1 }}><ListItemIcon sx={{ minWidth: 34 }}><DeveloperBoardRounded fontSize="small" color={item.state === 8 ? "success" : "action"} /></ListItemIcon><ListItemText primary={`${item.position}. ${item.name}`} secondary={`${stateLabel(item.state)} · ${item.input_size}/${item.output_size} B · ${item.chip_model}`} primaryTypographyProps={{ noWrap: true, fontWeight: 650, fontSize: 13.5 }} secondaryTypographyProps={{ noWrap: true, fontSize: 12 }} /></ListItemButton>)}</List></Box>}
-        <Box component="main" sx={{ flex: 1, minWidth: 0, overflow: "auto", p: { xs: 2, xl: 2.5 } }}><Box sx={{ width: "100%", maxWidth: 1760, mx: "auto" }}>{content}</Box></Box>
+        {status.slaves.length > 0 && <Box component="aside" sx={{ width: { xs: 210, xl: 224 }, flexShrink: 0, bgcolor: "background.paper", borderRight: 1, borderColor: "divider", overflow: "auto", p: 0.75 }}><Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ px: 0.75, py: 0.55 }}><Typography variant="overline" color="text.secondary">从站 · {status.slaves.length}</Typography><Chip size="small" variant="outlined" label={status.cycle_running ? "周期运行" : "周期停止"} /></Stack><List dense sx={{ pt: 0.35 }}>{status.slaves.map((item) => <ListItemButton disabled={eepromExclusive} key={item.position} selected={item.position === selectedPosition} onClick={() => setSelectedPosition(item.position)} onContextMenu={(event) => openSlaveContextMenu(event, item.position)} sx={{ mb: 0.25, py: 0.55, px: 0.75 }}><ListItemIcon sx={{ minWidth: 30 }}><DeveloperBoardRounded fontSize="small" color={item.state === 8 ? "success" : "action"} /></ListItemIcon><ListItemText primary={`${item.position}. ${item.name}`} secondary={`${stateLabel(item.state)} · ${item.input_size}/${item.output_size} B · ${item.chip_model}`} primaryTypographyProps={{ noWrap: true, fontWeight: 650, fontSize: 12.5 }} secondaryTypographyProps={{ noWrap: true, fontSize: 11.5 }} /></ListItemButton>)}</List></Box>}
+        <Box component="main" sx={{ flex: 1, minWidth: 0, overflow: "auto", p: { xs: 1.5, xl: 2 } }}><Box sx={{ width: "100%", maxWidth: 1840, mx: "auto" }}>{bridgeExit && <Alert severity="error" action={bridgeExit.log_path ? <Button color="inherit" size="small" onClick={() => revealPath(bridgeExit.log_path!)}>打开日志</Button> : undefined} sx={{ mb: 1.25 }}><Typography fontWeight={700}>通信核心已退出</Typography><Typography variant="body2">{bridgeExit.message}</Typography>{bridgeExit.log_path && <Typography variant="caption" className="mono" sx={{ overflowWrap: "anywhere" }}>日志：{bridgeExit.log_path}</Typography>}</Alert>}{content}</Box></Box>
       </Box>
     </Box>
     <Menu
@@ -742,8 +1044,9 @@ export default function App() {
         {settingsTab === 0 ? <Stack spacing={2} sx={{ pt: 0.5 }}>
           <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", p: 2, border: 1, borderColor: "divider", borderRadius: 1.25 }}>
             <Box><Typography fontWeight={700}>Demo 模式</Typography><Typography variant="body2" color="text.secondary">使用模拟从站，不访问实际 EtherCAT 网卡。</Typography></Box>
-            <Switch checked={status.mode === "demo"} disabled={status.connected} onChange={(e) => switchMode(e.target.checked)} />
+            <Switch checked={status.mode === "demo"} disabled={!bridgeAvailable || eepromExclusive || status.connected} onChange={(e) => switchMode(e.target.checked)} />
           </Box>
+          <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", p: 2, border: 1, borderColor: "divider", borderRadius: 1.25 }}><Box><Typography fontWeight={700}>AL 状态码语言</Typography><Typography variant="body2" color="text.secondary">切换概览页 AL 状态名称、说明与排查建议。</Typography></Box><FormControl size="small" sx={{ width: 150 }}><InputLabel>Language</InputLabel><Select label="Language" value={alLanguage} onChange={(event) => { const value = event.target.value as AlStatusLanguage; setAlLanguage(value); window.localStorage.setItem(AL_LANGUAGE_KEY, value); }}><MenuItem value="zh">中文</MenuItem><MenuItem value="en">English</MenuItem></Select></FormControl></Box>
           {status.connected && <Alert severity="info">切换模式前请停止周期通信并断开网卡。</Alert>}
         </Stack> : <Stack spacing={2} sx={{ pt: 0.5 }}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 2, p: 2, border: 1, borderColor: "divider", borderRadius: 1.25, bgcolor: "#F8FAFF" }}>
@@ -764,8 +1067,8 @@ export default function App() {
       </DialogContent>
       <DialogActions><Button onClick={() => setSettings(false)}>完成</Button></DialogActions>
     </Dialog>
-    <Snackbar open={Boolean(progress)} autoHideDuration={progress?.percent === 100 ? 6000 : null} onClose={(_, reason) => { if (reason !== "clickaway" && progress?.percent === 100) setProgress(undefined); }} anchorOrigin={{ vertical: "bottom", horizontal: "right" }}>
-      <Alert severity={progress?.tone === "error" ? "error" : progress?.tone === "success" ? "success" : "info"} variant="filled" action={progress && progress.percent < 100 ? <Button color="inherit" size="small" onClick={() => bridgeRequest("cancel")}>取消</Button> : undefined} sx={{ width: 440, alignItems: "center" }}>
+    <Snackbar open={Boolean(progress && !isEepromOperation(progress.operation))} autoHideDuration={progress?.percent === 100 ? 6000 : null} onClose={(_, reason) => { if (reason !== "clickaway" && progress?.percent === 100) setProgress(undefined); }} anchorOrigin={{ vertical: "bottom", horizontal: "right" }}>
+      <Alert severity={progress?.tone === "error" ? "error" : progress?.tone === "success" ? "success" : "info"} variant="filled" action={progress && progress.percent < 100 && progress.cancellable !== false ? <Button color="inherit" size="small" onClick={() => bridgeRequest("cancel")}>取消</Button> : undefined} sx={{ width: 440, alignItems: "center" }}>
         <Typography fontWeight={750}>{progress?.stage}</Typography><Typography variant="body2">{progress?.detail}</Typography>{progress && <LinearProgress color="inherit" variant="determinate" value={progress.percent} sx={{ mt: 1, height: 5, borderRadius: 8, bgcolor: "rgba(255,255,255,.25)" }} />}
       </Alert>
     </Snackbar>

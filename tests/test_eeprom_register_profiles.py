@@ -31,7 +31,7 @@ def test_mock_flash_does_not_create_backup_and_fully_verifies(sample_esi) -> Non
         target = SiiGenerator().generate(device).image
         backend._eeprom[0][0] ^= 0xFF
         progress = []
-        result = EepromService(backend, stability_wait_s=0, rediscovery_wait_s=0).flash(
+        result = EepromService(backend, stability_wait_s=0, rediscovery_timeout_s=0).flash(
             1, target, device, auto_reset=True, progress=progress.append
         )
         assert result.bytes_read_back == 2048
@@ -48,6 +48,75 @@ def test_mock_flash_does_not_create_backup_and_fully_verifies(sample_esi) -> Non
             "reset",
             "reload-verify",
         } <= stages
+    finally:
+        backend.disconnect()
+
+
+def test_rediscovery_polls_until_slave_returns(monkeypatch) -> None:
+    backend = MockBackend()
+    backend.connect("demo0")
+    clock = [0.0]
+    scans = 0
+    original_scan = backend.scan
+
+    def delayed_scan():
+        nonlocal scans
+        scans += 1
+        return [] if scans < 3 else original_scan()
+
+    def advance(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(backend, "scan", delayed_scan)
+    try:
+        service = EepromService(
+            backend,
+            rediscovery_timeout_s=3,
+            rediscovery_poll_s=0.5,
+            sleep=advance,
+            monotonic=lambda: clock[0],
+        )
+        assert service._rediscover(1) is True
+        assert scans == 3
+        assert clock[0] == 1.0
+    finally:
+        backend.disconnect()
+
+
+def test_flash_ignores_cancel_after_programming_begins(sample_esi, monkeypatch) -> None:
+    backend = MockBackend()
+    backend.connect("demo0")
+    try:
+        slave = backend.scan()[0]
+        device = replace(
+            sample_esi.devices[0],
+            vendor_id=slave.identity.vendor_id,
+            product_code=slave.identity.product_code,
+            revision=slave.identity.revision,
+        )
+        target = SiiGenerator().generate(device).image
+        backend._eeprom[0][0:4] = b"\x00\x00\x00\x00"
+        original_write = backend.eeprom_write
+        writes = 0
+        progress = []
+
+        def tracked_write(position: int, word_address: int, data: bytes) -> None:
+            nonlocal writes
+            original_write(position, word_address, data)
+            writes += 1
+
+        monkeypatch.setattr(backend, "eeprom_write", tracked_write)
+        result = EepromService(backend, stability_wait_s=0).flash(
+            1,
+            target,
+            device,
+            auto_reset=False,
+            progress=progress.append,
+            cancel=lambda: writes > 0,
+        )
+
+        assert writes > 0 and result.image_success
+        assert all(not item.cancellable for item in progress if item.stage != "read-current")
     finally:
         backend.disconnect()
 
@@ -79,6 +148,8 @@ def test_profiles_are_distinct_and_not_inferred_from_counts() -> None:
         "LAN9252",
         "LAN9252_COMPATIBLE",
     )
+    assert _chip_from_register(b"\xE2\x52\x00\x00") == ("E252", "LAN9252_COMPATIBLE")
+    assert _chip_from_register(b"\x00\x00\x00\x00") == ("Generic ESC", "GENERIC")
 
 
 def test_register_catalog_error_counters_and_pdi_registers() -> None:

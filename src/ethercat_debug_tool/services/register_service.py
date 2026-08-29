@@ -27,6 +27,7 @@ class RegisterWritePlan:
     target: bytes
     changed_mask: bytes
     known_register: bool
+    definition_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +48,18 @@ class RegisterService:
     def __init__(self, backend: EtherCatBackend) -> None:
         self.backend = backend
 
-    def read(self, position: int, address: int, size: int, timeout_us: int = 2000) -> RegisterRead:
+    def read(
+        self,
+        position: int,
+        address: int,
+        size: int,
+        timeout_us: int = 2000,
+        *,
+        address_space: str = "esc_core",
+        master_access_allowed: bool = True,
+    ) -> RegisterRead:
+        if address_space != "esc_core" or not master_access_allowed:
+            raise PermissionError("This register is not reachable through the EtherCAT master register path")
         if not 1 <= size <= 256 or not 0 <= address <= 0xFFFF or address + size > 0x10000:
             raise ValueError("Register read must stay within 0x0000–0xFFFF and be 1–256 bytes")
         started = time.perf_counter()
@@ -97,8 +109,16 @@ class RegisterService:
         known_register: bool,
         expected_width: int | None = None,
         expected_semantics: AccessSemantics | None = None,
+        definition_id: str | None = None,
+        address_space: str = "esc_core",
+        master_access_allowed: bool = True,
+        direct_write_allowed: bool = True,
         timeout_us: int = 2000,
     ) -> RegisterWritePlan:
+        if known_register and (address_space != "esc_core" or not master_access_allowed):
+            raise PermissionError("This register is not reachable through the EtherCAT master register path")
+        if known_register and not direct_write_allowed:
+            raise PermissionError("Known register requires a dedicated safe operation and cannot be written directly")
         if semantics is AccessSemantics.RO:
             raise PermissionError("Read-only register cannot be written")
         if not 1 <= len(target) <= 256 or address < 0 or address + len(target) > 0x10000:
@@ -121,6 +141,7 @@ class RegisterService:
             bytes(target),
             b"" if semantics is AccessSemantics.WO else changed_mask(current, target),
             known_register,
+            definition_id,
         )
 
     def execute_write(self, plan: RegisterWritePlan, timeout_us: int = 2000) -> RegisterWriteResult:

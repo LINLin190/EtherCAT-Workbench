@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 from typing import Any
 
+from ..al_status import al_status_info
 from ..models import (
     AdapterInfo,
     EtherCatState,
@@ -32,10 +33,18 @@ def _chip_from_register(
     ram_kib: int | None = None,
 ) -> tuple[str, str]:
     text = raw.rstrip(b"\x00").decode("ascii", errors="ignore").upper()
-    value = int.from_bytes(raw, "little")
     candidates = {"E101": "ET1100_COMPATIBLE", "E252": "LAN9252_COMPATIBLE", "E253": "LAN9253_COMPATIBLE"}
     for model, family in candidates.items():
-        if model in text or value == int(model, 16):
+        chip_id = int(model, 16)
+        # Vendor ESC identification registers are seen as either a 16-bit
+        # value or a 32-bit value depending on the PDI bridge byte order.
+        register_values = {
+            int.from_bytes(raw, "little"),
+            int.from_bytes(raw, "big"),
+            int.from_bytes(raw[:2], "little") if len(raw) >= 2 else -1,
+            int.from_bytes(raw[:2], "big") if len(raw) >= 2 else -1,
+        }
+        if model in text or chip_id in register_values:
             return model, family
     # LAN9252 exposes 3 FMMUs, 4 SyncManagers and 4 KiB DPRAM. This
     # capability signature is used only for the original Microchip part;
@@ -94,6 +103,10 @@ class PysoemBackend:
         try:
             master.open(adapter_name)
         except (ConnectionError, OSError) as exc:
+            try:
+                master.close()
+            except Exception:
+                pass
             hint = "请检查网卡状态、管理员权限以及 Npcap 的 WinPcap 兼容模式。"
             if ctypes.util.find_library("wpcap") is None:
                 hint = "未检测到 Npcap/wpcap，请安装 Npcap 并启用 WinPcap API-compatible Mode。"
@@ -103,14 +116,14 @@ class PysoemBackend:
         self._mapped = False
 
     def disconnect(self) -> None:
-        if self._master is not None:
-            try:
+        try:
+            if self._master is not None:
                 self._master.close()
-            finally:
-                self._master = None
-        self._connected = False
-        self._mapped = False
-        self._slaves = []
+        finally:
+            self._master = None
+            self._connected = False
+            self._mapped = False
+            self._slaves = []
 
     def _require_master(self) -> Any:
         if not self._connected or self._master is None:
@@ -125,12 +138,12 @@ class PysoemBackend:
 
     def _serial(self, slave: Any) -> int:
         try:
-            return int.from_bytes(slave.sdo_read(0x1018, 4, ca=False, release_gil=True), "little")
+            # Serial is the 32-bit SII identity field beginning at word 0x0E.
+            # Do not probe optional CoE 0x1018 during discovery: devices without
+            # mailbox support otherwise consume the full SDO timeout per slave.
+            return int.from_bytes(slave.eeprom_read(0x0E), "little")
         except Exception:
-            try:
-                return int.from_bytes(slave.eeprom_read(0x0E), "little")
-            except Exception:
-                return 0
+            return 0
 
     def _pdo_size(self, position: int, direction: PdoDirection) -> int:
         try:
@@ -174,8 +187,8 @@ class PysoemBackend:
             SlaveIdentity(slave.man, slave.id, slave.rev, self._serial(slave)),
             state,
             int(slave.al_status),
-            self._pdo_size(position, PdoDirection.TX),
-            self._pdo_size(position, PdoDirection.RX),
+            len(slave.input),
+            len(slave.output),
             configured_address,
             chip_model,
             family,
@@ -196,22 +209,85 @@ class PysoemBackend:
     def read_states(self) -> list[SlaveInfo]:
         master = self._require_master()
         master.read_state()
-        self._slaves = [self._info(i, slave) for i, slave in enumerate(master.slaves, 1)]
+        if len(self._slaves) != len(master.slaves):
+            self._slaves = [self._info(i, slave) for i, slave in enumerate(master.slaves, 1)]
+        else:
+            refreshed: list[SlaveInfo] = []
+            for cached, slave in zip(self._slaves, master.slaves, strict=True):
+                try:
+                    state = EtherCatState(int(slave.state) & 0x0F)
+                except ValueError:
+                    state = EtherCatState.NONE
+                refreshed.append(replace(cached, state=state, al_status=int(slave.al_status)))
+            self._slaves = refreshed
         return list(self._slaves)
 
     def request_state(self, position: int | None, state: EtherCatState, timeout_us: int) -> list[SlaveInfo]:
         master = self._require_master()
         target = master if position is None else self._slave(position)
-        if state is EtherCatState.OP and self._mapped:
+
+        # A direct PRE-OP -> SAFE-OP/OP request still needs the same PDO
+        # mapping setup as cyclic I/O. OP also requires one valid process-data
+        # exchange while the slave is in SAFE-OP before requesting OP.
+        if state in (EtherCatState.SAFE_OP, EtherCatState.OP) and not self._mapped:
+            self.map_process_data()
+
+        if state is EtherCatState.OP:
+            current = int(getattr(target, "state", EtherCatState.NONE)) & 0x0F
+            if current not in (int(EtherCatState.SAFE_OP), int(EtherCatState.OP)):
+                target.state = int(EtherCatState.SAFE_OP)
+                target.write_state()
+                safe_actual = target.state_check(int(EtherCatState.SAFE_OP), timeout_us)
+                if (safe_actual & 0x0F) != int(EtherCatState.SAFE_OP):
+                    try:
+                        self.read_states()
+                    except Exception:
+                        pass
+                    raise self._state_transition_error(target, EtherCatState.SAFE_OP, safe_actual, timeout_us)
             master.send_processdata(release_gil=True)
             master.receive_processdata(2000, release_gil=True)
+
         target.state = int(state)
         target.write_state()
         actual = target.state_check(int(state), timeout_us)
         if (actual & 0x0F) != int(state):
-            self.read_states()
-            raise CommunicationError(f"State transition to {state.label} failed (actual 0x{actual:02X})")
+            # Keep the original transition failure if a follow-up state read
+            # is unavailable. Diagnostics must never replace the root error.
+            try:
+                self.read_states()
+            except Exception:
+                pass
+            raise self._state_transition_error(target, state, actual, timeout_us)
         return self.read_states()
+
+    def _state_transition_error(
+        self, target: Any, requested: EtherCatState, actual: int, timeout_us: int
+    ) -> CommunicationError:
+        master = self._master
+        if master is not None and target is master:
+            candidates = list(getattr(master, "slaves", ()))
+        else:
+            candidates = [target]
+
+        diagnostics: list[str] = []
+        for index, slave in enumerate(candidates, 1):
+            al_status = int(getattr(slave, "al_status", 0)) & 0xFFFF
+            al_code: int | None = None
+            try:
+                al_code = int.from_bytes(slave._fprd(0x0134, 2, timeout_us), "little")
+            except Exception:
+                pass
+            name = str(getattr(slave, "name", "")).strip() or f"slave {index}"
+            detail = f"{name} AL status 0x{al_status:04X}"
+            if al_code is not None:
+                detail += f", AL status code 0x{al_code:04X}"
+                detail += f" ({al_status_info(al_code).name})"
+            diagnostics.append(detail)
+
+        details = "; ".join(diagnostics) or "AL status unavailable"
+        return CommunicationError(
+            f"State transition to {requested.label} failed (actual 0x{actual:02X}; {details})"
+        )
 
     def reconfig(self, position: int, timeout_us: int) -> bool:
         return bool(self._slave(position).reconfig(timeout_us))

@@ -33,6 +33,10 @@ Use four spaces in Python, core-logic type annotations, and Ruff’s 110-charact
 
 Use `pytest` for the Python core and the TypeScript/Vite build for the frontend. Name Python files `test_<area>.py` and tests `test_<behavior>`. Exercise Worker scheduling, codecs, ESI/SII, EEPROM, profiles, bridge commands, and register semantics. Tests must use Mock data and never write real hardware.
 
+## Visual Validation
+
+常用分辨率：`1920×1080`、`2560×1440`、`1280×720`；默认使用 `2560×1440`。
+
 ## Commit & Pull Request Guidelines
 
 Use concise imperative subjects with prefixes such as `fix:`, `feat:`, `docs:`, or `chore:`. Exclude generated artifacts. Pull requests must describe the problem, approach, verification, safety impact, and affected hardware/profile. Link issues, include UI screenshots, and label Mock-only verification.

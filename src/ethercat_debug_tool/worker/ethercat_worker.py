@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import Any
 
 from ..backends.base import EtherCatBackend
@@ -20,16 +20,27 @@ class Priority(IntEnum):
     WATCH = 50
 
 
+class WorkerState(StrEnum):
+    STARTING = "starting"
+    READY = "ready"
+    BUSY = "busy"
+    STALLED = "stalled"
+    STOPPING = "stopping"
+    EXITED = "exited"
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerEvent:
     kind: str
     payload: Any
+    session_id: int | None = None
 
 
 @dataclass(order=True, slots=True)
 class _Task:
     priority: int
     sequence: int
+    event_session_id: int | None = field(compare=False)
     future: Future[Any] = field(compare=False)
     operation: str | Callable[[EtherCatBackend], Any] = field(compare=False)
     args: tuple[Any, ...] = field(compare=False, default=())
@@ -39,9 +50,9 @@ class _Task:
 class EtherCatWorker:
     """The sole owner and scheduler of all calls made against one backend/master."""
 
-    def __init__(self, backend_factory: Callable[[], EtherCatBackend]) -> None:
+    def __init__(self, backend_factory: Callable[[], EtherCatBackend], *, queue_limit: int = 32) -> None:
         self._backend_factory = backend_factory
-        self._tasks: queue.PriorityQueue[_Task] = queue.PriorityQueue()
+        self._tasks: queue.PriorityQueue[_Task] = queue.PriorityQueue(maxsize=queue_limit)
         self._events: queue.SimpleQueue[WorkerEvent] = queue.SimpleQueue()
         self._stop = threading.Event()
         self._seq = itertools.count()
@@ -52,6 +63,19 @@ class EtherCatWorker:
         self._next_cycle = 0.0
         self._max_consecutive_errors = 5
         self._needs_safe_state = False
+        self._cycle_session_id: int | None = None
+        self._state = WorkerState.STARTING
+
+    @property
+    def state(self) -> WorkerState:
+        return self._state
+
+    @property
+    def queue_depth(self) -> int:
+        return self._tasks.qsize()
+
+    def mark_stalled(self) -> None:
+        self._state = WorkerState.STALLED
 
     @property
     def is_alive(self) -> bool:
@@ -66,19 +90,45 @@ class EtherCatWorker:
         operation: str | Callable[[EtherCatBackend], Any],
         *args: Any,
         priority: Priority = Priority.NORMAL,
+        event_session_id: int | None = None,
         **kwargs: Any,
     ) -> Future[Any]:
         future: Future[Any] = Future()
-        self._tasks.put(_Task(int(priority), next(self._seq), future, operation, args, kwargs))
+        if self._stop.is_set() or not self._thread.is_alive():
+            future.set_exception(RuntimeError("EtherCAT Worker is not running"))
+            return future
+        if self._state is WorkerState.STALLED:
+            future.set_exception(RuntimeError("EtherCAT Worker is stalled"))
+            return future
+        try:
+            self._tasks.put_nowait(
+                _Task(int(priority), next(self._seq), event_session_id, future, operation, args, kwargs)
+            )
+        except queue.Full:
+            future.set_exception(RuntimeError("EtherCAT hardware queue is full"))
         return future
 
-    def start_cycle(self, period_ms: float, timeout_us: int, max_consecutive_errors: int = 5) -> Future[Any]:
+    def start_cycle(
+        self,
+        period_ms: float,
+        timeout_us: int,
+        max_consecutive_errors: int = 5,
+        *,
+        event_session_id: int | None = None,
+    ) -> Future[Any]:
         return self.submit(
-            "__start_cycle__", period_ms, timeout_us, max_consecutive_errors, priority=Priority.CONTROL
+            "__start_cycle__",
+            period_ms,
+            timeout_us,
+            max_consecutive_errors,
+            priority=Priority.CONTROL,
+            event_session_id=event_session_id,
         )
 
-    def stop_cycle(self) -> Future[Any]:
-        return self.submit("__stop_cycle__", priority=Priority.CONTROL)
+    def stop_cycle(self, *, event_session_id: int | None = None) -> Future[Any]:
+        return self.submit(
+            "__stop_cycle__", priority=Priority.CONTROL, event_session_id=event_session_id
+        )
 
     def poll_events(self, limit: int = 100) -> list[WorkerEvent]:
         result: list[WorkerEvent] = []
@@ -90,8 +140,12 @@ class EtherCatWorker:
         return result
 
     def shutdown(self, timeout: float = 5.0) -> bool:
+        self._state = WorkerState.STOPPING
         self._stop.set()
-        self._tasks.put(_Task(-1, next(self._seq), Future(), "__wake__"))
+        try:
+            self._tasks.put_nowait(_Task(-1, next(self._seq), None, Future(), "__wake__"))
+        except queue.Full:
+            pass
         self._thread.join(timeout)
         return not self._thread.is_alive()
 
@@ -112,9 +166,10 @@ class EtherCatWorker:
         return backend.request_state(None, EtherCatState.SAFE_OP, 2_000_000)
 
     def _execute(self, task: _Task) -> None:
-        if task.future.cancelled() or self._backend is None:
+        if self._backend is None or not task.future.set_running_or_notify_cancel():
             return
         try:
+            self._state = WorkerState.BUSY
             if task.operation == "__start_cycle__":
                 result = self._configure_cycle(self._backend, *task.args, **task.kwargs)
                 (
@@ -125,14 +180,16 @@ class EtherCatWorker:
                     first_snapshot,
                 ) = result
                 self._needs_safe_state = True
+                self._cycle_session_id = task.event_session_id
                 self._next_cycle = time.perf_counter()
-                self._events.put(WorkerEvent("process_data", first_snapshot))
-                self._events.put(WorkerEvent("cycle_started", slaves))
+                self._events.put(WorkerEvent("process_data", first_snapshot, task.event_session_id))
+                self._events.put(WorkerEvent("cycle_started", slaves, task.event_session_id))
             elif task.operation == "__stop_cycle__":
                 result = self._disable_cycle(self._backend)
                 self._cycle_period = 0.0
                 self._needs_safe_state = False
-                self._events.put(WorkerEvent("cycle_stopped", result))
+                self._events.put(WorkerEvent("cycle_stopped", result, self._cycle_session_id))
+                self._cycle_session_id = None
             elif callable(task.operation):
                 result = task.operation(self._backend, *task.args, **task.kwargs)
             elif task.operation == "__wake__":
@@ -146,38 +203,59 @@ class EtherCatWorker:
                 try:
                     slaves = self._disable_cycle(self._backend)
                     self._needs_safe_state = False
-                    self._events.put(WorkerEvent("slaves_changed", slaves))
+                    self._events.put(WorkerEvent("slaves_changed", slaves, task.event_session_id))
                 except Exception:
                     self._needs_safe_state = True
+            elif task.operation == "__stop_cycle__":
+                self._cycle_period = 0.0
+                self._needs_safe_state = self._backend.connected
             task.future.set_exception(exc)
-            self._events.put(WorkerEvent("error", exc))
+            self._events.put(WorkerEvent("error", exc, task.event_session_id))
+        finally:
+            if self._state is WorkerState.BUSY:
+                self._state = WorkerState.READY
 
     def _run_cycle(self) -> None:
         assert self._backend is not None
         try:
             snapshot = self._backend.exchange_process_data(self._cycle_timeout_us)
-            self._events.put(WorkerEvent("process_data", snapshot))
+            self._events.put(WorkerEvent("process_data", snapshot, self._cycle_session_id))
             if snapshot.consecutive_errors >= self._max_consecutive_errors:
                 self._cycle_period = 0.0
                 try:
                     slaves = self._disable_cycle(self._backend)
                     self._needs_safe_state = False
-                    self._events.put(WorkerEvent("slaves_changed", slaves))
+                    self._events.put(WorkerEvent("slaves_changed", slaves, self._cycle_session_id))
                 except Exception:
                     pass
-                self._events.put(WorkerEvent("cycle_fault", snapshot))
+                self._events.put(WorkerEvent("cycle_fault", snapshot, self._cycle_session_id))
+                self._cycle_session_id = None
         except BaseException as exc:
             self._cycle_period = 0.0
             try:
                 slaves = self._disable_cycle(self._backend)
                 self._needs_safe_state = False
-                self._events.put(WorkerEvent("slaves_changed", slaves))
+                self._events.put(WorkerEvent("slaves_changed", slaves, self._cycle_session_id))
             except Exception:
                 pass
-            self._events.put(WorkerEvent("cycle_fault", exc))
+            self._events.put(WorkerEvent("cycle_fault", exc, self._cycle_session_id))
+            self._cycle_session_id = None
 
     def _run(self) -> None:
-        self._backend = self._backend_factory()
+        try:
+            self._backend = self._backend_factory()
+        except BaseException as exc:
+            self._state = WorkerState.EXITED
+            self._events.put(WorkerEvent("worker_fatal", exc))
+            while True:
+                try:
+                    task = self._tasks.get_nowait()
+                except queue.Empty:
+                    break
+                if not task.future.done():
+                    task.future.set_exception(RuntimeError(f"EtherCAT Worker failed to start: {exc}"))
+            return
+        self._state = WorkerState.READY
         self._events.put(WorkerEvent("ready", None))
         try:
             while not self._stop.is_set():
@@ -218,3 +296,4 @@ class EtherCatWorker:
                 except Exception as exc:
                     self._events.put(WorkerEvent("error", exc))
             self._events.put(WorkerEvent("stopped", None))
+            self._state = WorkerState.EXITED
