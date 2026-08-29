@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 用户显式检测网卡、连接和扫描；扫描成功后保持连接
+- 启动时按用户优先网卡和枚举顺序自动连接、扫描，发现从站后保持连接
 - INIT / PRE-OP / SAFE-OP / OP 状态控制与故障恢复
 - ESC 标准寄存器搜索、读取、监视和两阶段安全写入
 - ESI XML 自动生成 SII、Smart View、容量检查、完整读取、BIN 备份、烧录、验证与恢复
@@ -22,7 +22,7 @@ React + Material UI + Emotion
               │
               ▼
         Tauri 2 / Rust
-              │ 私有 Named Pipe 分帧 JSON
+              │ 私有 stdin/stdout JSON
               ▼
        Python Bridge
               │
