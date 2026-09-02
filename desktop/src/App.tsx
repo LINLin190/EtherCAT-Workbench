@@ -111,9 +111,6 @@ const pages: { key: PageKey; label: string; icon: ReactNode }[] = [
 
 const cardSx = { borderRadius: 1.25, minWidth: 0 };
 const registerProfiles = ["ET1100", "LAN9252", "LAN9253"];
-const registerProfileFamily: Record<string, string> = {
-  ET1100: "ET1100_COMPATIBLE", LAN9252: "LAN9252_COMPATIBLE", LAN9253: "LAN9253_COMPATIBLE",
-};
 
 function slaveIdentityKey(slave?: SlaveInfo): string {
   if (!slave) return "none";
@@ -141,22 +138,6 @@ function defaultRegisterProfile(chipModel: string | undefined): string {
   if (chipModel === "LAN9252" || chipModel === "E252") return "LAN9252";
   if (chipModel === "LAN9253" || chipModel === "E253") return "LAN9253";
   return "ET1100";
-}
-
-const masterPhaseLabels: Record<WorkbenchStatus["phase"], string> = {
-  disconnected: "未连接",
-  adapter_open: "网卡已打开",
-  bus_scanned: "已扫描总线",
-  pdo_configured: "PDO 已配置",
-  cyclic: "周期通信中",
-  faulted: "通信故障",
-};
-
-function profileCompatibilityText(chipModel: string | undefined): string | undefined {
-  if (chipModel === "E252") return "已识别国产 E252；寄存器目录和安全规则完整采用 LAN9252 同构定义。";
-  if (chipModel === "E101") return "已识别国产 E101；寄存器目录和安全规则完整采用 ET1100 同构定义。";
-  if (chipModel === "E253") return "已识别国产 E253；寄存器目录和安全规则完整采用 LAN9253 同构定义。";
-  return undefined;
 }
 
 function PageTitle({ title, subtitle, actions }: { title: string; subtitle: string; actions?: ReactNode }) {
@@ -190,6 +171,7 @@ function StateChip({ state }: { state: number }) {
 }
 
 function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfile, onRegisterProfileChange, alLanguage }: { slave?: SlaveInfo; slaves: SlaveInfo[]; status: WorkbenchStatus; busy: boolean; run: Run; refresh: () => Promise<void>; registerProfile: string; onRegisterProfileChange: (profile: string) => void; alLanguage: AlStatusLanguage }) {
+  const [switchingProfile, setSwitchingProfile] = useState<string>();
   const requestState = (state: number) => run(
     () => bridgeRequest<SlaveInfo[]>("request_state", { position: slave?.position ?? 0, state }),
     `已请求 ${stateLabel(state)}`,
@@ -198,6 +180,19 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
     () => bridgeRequest<{ slaves: SlaveInfo[] }>(method, { position: slave.position }),
     success,
   );
+  const changeEscModel = async (profile: string) => {
+    if (!slave || profile === registerProfile || switchingProfile) return;
+    setSwitchingProfile(profile);
+    try {
+      const result = await run(
+        () => bridgeRequest<{ succeeded: boolean; slaves: SlaveInfo[] }>("reconfig", { position: slave.position }),
+        `从站 ${slave.position} 已完成重配置，ESC 型号切换为 ${profile}`,
+      );
+      if (result) onRegisterProfileChange(profile);
+    } finally {
+      setSwitchingProfile(undefined);
+    }
+  };
   const allOp = slaves.length > 0 && slaves.every((item) => item.state === 8);
   const alInfo = alStatusInfo(slave?.al_status ?? 0, alLanguage);
   return (
@@ -212,21 +207,35 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
         <Stack spacing={1.25}>
           <Card sx={cardSx}>
             <CardContent>
-              <Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(155px, 1fr))", gap: 1.5, alignItems: "center" }}>
-                <Box>
+              <Box><Typography variant="h6">运行摘要</Typography><Typography variant="caption" color="text.secondary">当前从站的运行状态与诊断信息</Typography></Box>
+              <Box className="overview-summary-grid">
+                <Box className="overview-metric">
                   <Typography className="section-label">当前状态</Typography>
                   <Stack direction="row" alignItems="center" gap={1} sx={{ mt: 0.45 }}>
                     <StateChip state={slave.state} />
                     <Typography variant="body2" color="text.secondary">从站 {slave.position}</Typography>
                   </Stack>
                 </Box>
-                <Box><Typography className="section-label">输入 / 输出</Typography><Typography className="kv-value mono" fontWeight={700}>{slave.input_size} B / {slave.output_size} B</Typography></Box>
-                <Box><Typography className="section-label">总线阶段</Typography><Typography className="kv-value" fontWeight={700}>{masterPhaseLabels[status.phase]}</Typography><Typography variant="caption" color="text.secondary">{status.connected ? "通信核心已连接" : "尚未连接网卡"}</Typography></Box>
-                <Box><Typography className="section-label">检测 ESC / 寄存器族</Typography><Typography className="kv-value" fontWeight={700} title={`${slave.chip_model} / ${slave.register_family}`}>{slave.chip_model} / {slave.register_family}</Typography></Box>
-                <Box><FormControl size="small" fullWidth><InputLabel>寄存器目录</InputLabel><Select label="寄存器目录" value={registerProfile} onChange={(event) => onRegisterProfileChange(String(event.target.value))}>{registerProfiles.map((profile) => <MenuItem key={profile} value={profile}>{profile} · {registerProfileFamily[profile]}</MenuItem>)}</Select></FormControl><Typography variant="caption" color="text.secondary">仅决定目录与安全规则，不改变硬件识别。</Typography></Box>
-                <Box><Typography className="section-label">AL 状态码</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.al_status)}</Typography><Typography variant="caption" color={slave.al_status ? "warning.main" : "text.secondary"}>{alInfo.name}</Typography></Box>
+                <Box className="overview-metric">
+                  <Typography className="section-label">过程数据</Typography>
+                  <Stack direction="row" divider={<Divider orientation="vertical" flexItem />} spacing={2} sx={{ mt: 0.4 }}>
+                    <Box><Typography variant="caption" color="text.secondary">输入</Typography><Typography className="mono" fontWeight={750}>{slave.input_size} B</Typography></Box>
+                    <Box><Typography variant="caption" color="text.secondary">输出</Typography><Typography className="mono" fontWeight={750}>{slave.output_size} B</Typography></Box>
+                  </Stack>
+                </Box>
+                <Box className="overview-metric overview-esc-selector">
+                  <FormControl size="small" fullWidth disabled={busy || status.cycle_running || Boolean(switchingProfile)}>
+                    <InputLabel>ESC 型号</InputLabel>
+                    <Select label="ESC 型号" value={registerProfile} onChange={(event) => void changeEscModel(String(event.target.value))}>
+                      {registerProfiles.map((profile) => <MenuItem key={profile} value={profile}>{profile}</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                  <Typography variant="caption" color={status.cycle_running ? "warning.main" : "text.secondary"}>
+                    {status.cycle_running ? "停止周期通信后可切换" : switchingProfile ? `正在应用 ${switchingProfile} 并重配置从站…` : "切换后自动重配置；不会改写 EEPROM"}
+                  </Typography>
+                </Box>
+                <Box className="overview-metric"><Typography className="section-label">AL 状态码</Typography><Typography className="kv-value mono" fontWeight={750}>{hex(slave.al_status)}</Typography><Typography variant="caption" color={slave.al_status ? "warning.main" : "text.secondary"}>{alInfo.name}</Typography></Box>
               </Box>
-              {profileCompatibilityText(slave.chip_model) && <Alert severity="info" sx={{ mt: 1.5 }}>{profileCompatibilityText(slave.chip_model)}</Alert>}
               {slave.al_status !== 0 && <Alert severity={alInfo.known ? "warning" : "error"} sx={{ mt: 1.5 }}><Typography fontWeight={700}>{hex(slave.al_status)} · {alInfo.name}</Typography><Typography variant="body2">说明：{alInfo.detail}</Typography><Typography variant="body2">排查：{alInfo.action}</Typography></Alert>}
             </CardContent>
           </Card>
@@ -236,11 +245,11 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
                 <Box><Typography variant="h6">设备身份</Typography><Typography variant="caption" color="text.secondary">当前从站的识别与地址信息</Typography></Box>
                 <Chip size="small" variant="outlined" label={slave.configured_address === undefined ? "配置地址：未知" : `配置地址：${hex(slave.configured_address)}`} />
               </Stack>
-              <Box className="kv-grid">
-                <Box className="kv-item"><Typography className="section-label">Vendor ID（厂商 ID）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.vendor_id, 8)}</Typography></Box>
-                <Box className="kv-item"><Typography className="section-label">Product Code（产品代码）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.product_code, 8)}</Typography></Box>
-                <Box className="kv-item"><Typography className="section-label">Revision（修订版本）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.revision, 8)}</Typography></Box>
-                <Box className="kv-item"><Typography className="section-label">Serial Number（序列号）</Typography><Typography className="kv-value mono" fontWeight={650}>{hex(slave.identity.serial_number, 8)}</Typography></Box>
+              <Box className="kv-grid overview-identity-grid">
+                <Box className="kv-item overview-identity-item"><Typography className="section-label">厂商 ID / Vendor ID</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.identity.vendor_id, 8)}</Typography></Box>
+                <Box className="kv-item overview-identity-item"><Typography className="section-label">产品代码 / Product Code</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.identity.product_code, 8)}</Typography></Box>
+                <Box className="kv-item overview-identity-item"><Typography className="section-label">修订版本 / Revision</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.identity.revision, 8)}</Typography></Box>
+                <Box className="kv-item overview-identity-item"><Typography className="section-label">序列号 / Serial Number</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.identity.serial_number, 8)}</Typography></Box>
               </Box>
             </CardContent>
           </Card>
@@ -250,12 +259,15 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
                 <Box><Typography variant="h6">状态控制</Typography><Typography variant="caption" color="text.secondary">请求由后台串行执行，完成后重新读取总线状态。</Typography></Box>
                 <Chip size="small" variant="outlined" label={allOp ? "总线已就绪" : `${slaves.length} 个从站`} />
               </Stack>
-              <Stack direction="row" gap={0.75} flexWrap="wrap">
-                {[1, 2, 4, 8].map((state) => <Button disabled={busy || status.cycle_running} key={state} variant={slave.state === state ? "contained" : "outlined"} onClick={() => requestState(state)}>{stateLabel(state)}</Button>)}
-                <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
-                <Button disabled={busy || status.cycle_running} size="small" color="warning" onClick={() => repair("reconfig", "重配置完成")}>重配置</Button>
-                <Button disabled={busy || status.cycle_running} size="small" color="warning" onClick={() => repair("recover", "恢复并通过状态复核")}>故障恢复</Button>
-              </Stack>
+              <Box className="overview-control-row">
+                <Stack direction="row" gap={0.45} flexWrap="wrap" alignItems="center">
+                  {[1, 2, 4, 8].map((state, index) => <Stack direction="row" alignItems="center" gap={0.45} key={state}>{index > 0 && <Typography className="state-flow-arrow">→</Typography>}<Button disabled={busy || status.cycle_running} variant={slave.state === state ? "contained" : "outlined"} onClick={() => requestState(state)}>{stateLabel(state)}</Button></Stack>)}
+                </Stack>
+                <Stack direction="row" gap={0.5} className="overview-repair-actions">
+                  <Button disabled={busy || status.cycle_running} size="small" color="warning" variant="outlined" onClick={() => repair("reconfig", "重配置完成")}>重配置</Button>
+                  <Button disabled={busy || status.cycle_running} size="small" color="warning" variant="outlined" onClick={() => repair("recover", "恢复并通过状态复核")}>故障恢复</Button>
+                </Stack>
+              </Box>
             </CardContent>
           </Card>
           <Alert severity={allOp ? "success" : slave.al_status ? "warning" : "info"}>{allOp ? "全部从站处于 OP，总线已就绪。" : slave.al_status ? `当前从站报告 AL 状态码 ${hex(slave.al_status)}：${alInfo.name}。` : `已发现 ${slaves.length} 个从站；可在概览中逐站控制状态。`}</Alert>
@@ -504,10 +516,9 @@ function RegistersPage({ slave, run, registerProfile }: { slave?: SlaveInfo; run
   const planRemaining = plan ? Math.max(0, Math.ceil((plan.expiresAt - planNow) / 1000)) : 0;
   const planExpired = Boolean(plan && planRemaining === 0);
 
-  return <><PageTitle title="寄存器" subtitle={slave ? `从站 ${slave.position} · 使用 ${registerProfile} · ${registerProfileFamily[registerProfile]}` : "标准 ESC 寄存器读取与诊断"} actions={<Stack direction="row" gap={1} alignItems="center">{readingDefinitionId && <><CircularProgress size={18} /><Typography variant="caption">正在读取寄存器…</Typography></>}{result?.data && <Button size="small" variant="outlined" onClick={() => void copyReadValue()}>{copied ? "已复制" : "复制读取值"}</Button>}</Stack>} />
+  return <><PageTitle title="寄存器" subtitle={slave ? `从站 ${slave.position} · ESC 型号 ${registerProfile}` : "标准 ESC 寄存器读取与诊断"} actions={<Stack direction="row" gap={1} alignItems="center">{readingDefinitionId && <><CircularProgress size={18} /><Typography variant="caption">正在读取寄存器…</Typography></>}{result?.data && <Button size="small" variant="outlined" onClick={() => void copyReadValue()}>{copied ? "已复制" : "复制读取值"}</Button>}</Stack>} />
     {!slave ? <EmptyState text="请先选择从站" /> : <Stack spacing={1.5}>
       <Alert severity="info">目标：从站 {slave.position} · 配置地址 {slave.configured_address === undefined ? "未知" : hex(slave.configured_address)} · 默认只读；所有写入均记录 AUDIT。</Alert>
-      {profileCompatibilityText(slave.chip_model) && <Alert severity="info">{profileCompatibilityText(slave.chip_model)} 当前显示的 {registerProfile} 是文档目录选择，不会将 E252 伪装为原厂 LAN9252。</Alert>}
       <Box sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(250px, .78fr) minmax(0, 1.22fr)", xl: "minmax(270px, .78fr) minmax(0, 1.22fr)" }, gap: 1.25, minHeight: 0 }}>
         <Card sx={cardSx}>
           <CardContent sx={{ pb: "10px !important" }}>
@@ -515,7 +526,7 @@ function RegistersPage({ slave, run, registerProfile }: { slave?: SlaveInfo; run
               <TextField fullWidth size="small" placeholder="搜索名称、地址、类别或地址空间" value={query} onChange={(e) => setQuery(e.target.value)} />
               <FormControl fullWidth size="small"><InputLabel>类别</InputLabel><Select label="类别" value={group} onChange={(e) => setGroup(String(e.target.value))}>{groups.map((item) => <MenuItem value={item} key={item}>{item}</MenuItem>)}</Select></FormControl>
               <Typography variant="caption" color="text.secondary">{filtered.length} / {catalog.length} 项；本地 PDI/HBI/PHY 项仅供查阅。</Typography>
-              {catalogError && <Alert severity="error">加载 {registerProfile} 寄存器目录失败：{catalogError}</Alert>}
+              {catalogError && <Alert severity="error">加载 {registerProfile} 寄存器定义失败：{catalogError}</Alert>}
             </Stack>
           </CardContent>
           <Divider />
