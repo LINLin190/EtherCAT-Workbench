@@ -37,6 +37,11 @@ Use `pytest` for the Python core and the TypeScript/Vite build for the frontend.
 
 常用分辨率：`1920×1080`、`2560×1440`、`1280×720`；默认使用 `2560×1440`。
 
+真实硬件问题审查不得使用 Demo/Preview 模式作为证据。必须通过
+`Start-EtherCAT-Workbench.cmd` 启动 Tauri 应用并验证 Real 模式的
+Python Bridge、pySOEM 和实际网卡链路；Demo/Mock 仅用于不涉及硬件的
+界面或协议测试。
+
 ## Commit & Pull Request Guidelines
 
 Use concise imperative subjects with prefixes such as `fix:`, `feat:`, `docs:`, or `chore:`. Exclude generated artifacts. Pull requests must describe the problem, approach, verification, safety impact, and affected hardware/profile. Link issues, include UI screenshots, and label Mock-only verification.

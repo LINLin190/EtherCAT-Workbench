@@ -75,6 +75,7 @@ import type {
   PdoEntry,
   RegisterDefinition,
   SlaveInfo,
+  AutoScanResult,
   WorkbenchStatus,
 } from "./types";
 import { hex, stateLabel } from "./types";
@@ -811,6 +812,13 @@ export default function App() {
     await bridgeRequest<SlaveInfo[]>("read_states");
   }, [refresh, status.connected, status.slaves.length]);
 
+  const applyAdapters = useCallback((items: AdapterInfo[]) => {
+    const ordered = orderAdapters(items);
+    const preferred = window.localStorage.getItem(PREFERRED_ADAPTER_KEY) ?? "";
+    setAdapters(ordered);
+    setAdapter(ordered.some((item) => item.name === preferred) ? preferred : ordered[0]?.name ?? "");
+  }, []);
+
   useEffect(() => {
     const disableBrowserContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", disableBrowserContextMenu);
@@ -821,12 +829,24 @@ export default function App() {
     let active = true;
     let unlisten: (() => void) | undefined;
     let unlistenExit: (() => void) | undefined;
-    const bootstrap = () => bridgeRequest<WorkbenchStatus>("status")
-      .then((result) => {
+    let bootstrapInFlight = false;
+    let bootstrapPending = false;
+    let bootstrappedGeneration: number | undefined;
+    const bootstrap = async () => {
+      if (!active || bootstrappedGeneration !== undefined) return;
+      if (bootstrapInFlight) {
+        bootstrapPending = true;
+        return;
+      }
+      bootstrapInFlight = true;
+      try {
+        const current = await bridgeRequest<WorkbenchStatus>("status");
+        const items = await bridgeRequest<AdapterInfo[]>("enumerate_adapters");
         if (!active) return;
-        return result;
-      })
-      .catch((error) => {
+        applyAdapters(items);
+        bootstrappedGeneration = current.host_generation;
+        bootstrapPending = false;
+      } catch (error) {
         if (!active) return;
         const text = error instanceof Error ? error.message : String(error);
         if (/Python EtherCAT|桥接通信|桥接进程/.test(text)) {
@@ -834,20 +854,23 @@ export default function App() {
           setSelectedPosition(undefined);
         }
         setMessage({ text, severity: "error" });
-      })
-      .finally(() => {
-      });
+      } finally {
+        bootstrapInFlight = false;
+        if (active && bootstrapPending) {
+          bootstrapPending = false;
+          void bootstrap();
+        }
+      }
+    };
     const eventReady = onBridgeEvent((event: BridgeEvent) => {
       if (["ready", "host_ready"].includes(event.kind)) {
         setBridgeAvailable(true);
         setBridgeExit(undefined);
         setMessage((current) => current?.text.includes("通信核心") ? undefined : current);
-        if (event.kind === "host_ready") {
-          void bridgeRequest<WorkbenchStatus>("status").catch((error) => {
-            const text = error instanceof Error ? error.message : String(error);
-            setMessage({ text, severity: "error" });
-          });
-        }
+        const generation = event.host_generation
+          ?? (event.data as { host_generation?: number } | undefined)?.host_generation;
+        if (generation !== undefined && generation !== bootstrappedGeneration) bootstrappedGeneration = undefined;
+        void bootstrap();
       }
       if (event.kind === "host_restart_failed") {
         const data = event.data as { message?: string };
@@ -913,20 +936,42 @@ export default function App() {
     }).then((value) => { if (active) unlistenExit = value; else value(); });
     Promise.all([eventReady, exitReady]).then(() => { if (active) bootstrap(); });
     return () => { active = false; unlisten?.(); unlistenExit?.(); };
-  }, []);
+  }, [applyAdapters]);
 
   const connect = async () => {
     if (status.connected) await run(() => bridgeRequest("disconnect"), "已断开网卡");
     else await run(() => bridgeRequest("connect", { adapter }), "网卡已连接");
   };
-  const enumerateAdapters = async () => {
-    const items = await run(() => bridgeRequest<AdapterInfo[]>("enumerate_adapters"));
-    if (!items) return;
-    const ordered = orderAdapters(items);
+  const autoScan = async () => {
     const preferred = window.localStorage.getItem(PREFERRED_ADAPTER_KEY) ?? "";
+    const result = await run(() => bridgeRequest<AutoScanResult>("auto_scan", { preferred_adapter: preferred }));
+    if (!result) return;
+
+    const ordered = orderAdapters(result.adapters);
+    const selected = result.selected_adapter || preferred;
     setAdapters(ordered);
-    setAdapter(ordered.some((item) => item.name === preferred) ? preferred : ordered[0]?.name ?? "");
-    if (!items.length) setMessage({ text: "未发现可用网卡，请检查 Npcap 和网卡状态。", severity: "info" });
+    setAdapter(ordered.some((item) => item.name === selected) ? selected : ordered[0]?.name ?? "");
+    if (result.connected && result.slaves.length) {
+      if (result.selected_adapter) window.localStorage.setItem(PREFERRED_ADAPTER_KEY, result.selected_adapter);
+      const adapterName = result.adapters.find((item) => item.name === result.selected_adapter)?.description
+        || result.selected_adapter;
+      setMessage({ text: `已在 ${adapterName} 上发现 ${result.slaves.length} 个从站`, severity: "success" });
+      return;
+    }
+
+    if (!result.adapters.length) {
+      setMessage({ text: "未枚举到网卡：pySOEM 没有返回可用适配器。请检查 Npcap、WinPcap 兼容模式和网卡驱动。", severity: "error" });
+      return;
+    }
+    const failed = result.attempts.filter((attempt) => attempt.error);
+    const openedWithoutSlaves = result.attempts.filter((attempt) => !attempt.error && attempt.slave_count === 0);
+    if (failed.length && failed.length === result.attempts.length) {
+      setMessage({ text: `已枚举到 ${result.adapters.length} 个网卡，但全部无法打开：${failed[0].error}`, severity: "error" });
+    } else if (openedWithoutSlaves.length) {
+      setMessage({ text: `网卡已打开并完成 EtherCAT 探测，但没有从站响应。请检查专用网线、链路和从站供电；另有 ${failed.length} 个网卡打开失败。`, severity: "info" });
+    } else {
+      setMessage({ text: `自动扫描未发现从站：已尝试 ${result.attempts.length} 个网卡。请检查 Npcap 权限、链路和从站供电。`, severity: "info" });
+    }
   };
   const scan = async () => {
     const found = await run(() => bridgeRequest<SlaveInfo[]>("scan"));
@@ -1007,9 +1052,9 @@ export default function App() {
               {status.mode === "demo" && <Chip size="small" color="warning" label="Demo" />}
               {previewMode && <Chip size="small" variant="outlined" label="预览" />}
             </Stack>
-            <Typography variant="caption" color="text.secondary">{!bridgeAvailable ? "通信核心正在恢复" : status.connected ? `已发现 ${status.slaves.length} 个从站` : "先检测网卡，再手动连接和扫描"}</Typography>
+            <Typography variant="caption" color="text.secondary">{!bridgeAvailable ? "通信核心正在恢复" : status.connected ? `已发现 ${status.slaves.length} 个从站` : "检测网卡并自动扫描 EtherCAT 从站"}</Typography>
           </Stack>
-          <Button size="small" variant="outlined" startIcon={<RefreshRounded />} disabled={!bridgeAvailable || eepromExclusive || busy || status.connected} onClick={enumerateAdapters}>检测网卡</Button>
+          <Button size="small" variant="outlined" startIcon={<RefreshRounded />} disabled={!bridgeAvailable || eepromExclusive || busy || status.connected} onClick={autoScan}>检测并扫描</Button>
           <FormControl size="small" sx={{ width: { xs: 240, xl: 300 } }}><InputLabel>网卡</InputLabel><Select label="网卡" value={adapter} disabled={!bridgeAvailable || eepromExclusive || status.connected || busy} onChange={(e) => selectAdapter(e.target.value)}>{adapters.map((item) => <MenuItem value={item.name} key={item.name}>{item.description || item.name}</MenuItem>)}</Select></FormControl>
           <Button size="small" variant={status.connected ? "outlined" : "contained"} color={status.connected ? "error" : "primary"} startIcon={<UsbRounded />} disabled={!bridgeAvailable || eepromExclusive || busy || (!status.connected && !adapter)} onClick={connect}>{status.connected ? "断开" : "连接"}</Button>
           <Button size="small" variant="outlined" startIcon={<RefreshRounded />} disabled={!bridgeAvailable || eepromExclusive || busy || !status.connected || status.cycle_running} onClick={scan}>扫描</Button>

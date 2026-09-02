@@ -185,7 +185,7 @@ class PreviewBridge {
           selected_adapter: "preview0",
           connected: true,
           slaves: this.scanned,
-          attempts: [{ adapter: "preview0", slave_count: this.scanned.length }],
+          attempts: [{ adapter: "preview0", slave_count: this.scanned.length, elapsed_ms: 0 }],
         } satisfies AutoScanResult as T;
       }
       case "connect":

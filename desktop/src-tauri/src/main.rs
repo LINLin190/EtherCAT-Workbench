@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
-#[cfg(test)]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
 const COMMAND_REGISTRY: &str =
@@ -199,6 +197,49 @@ fn activate_next_generation(next: &AtomicU64, current: &AtomicU64) -> u64 {
     generation
 }
 
+#[cfg(windows)]
+struct SingleInstanceGuard(usize);
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0 as _);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\EtherCATWorkbench.com.ethercat.workbench"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(format!(
+            "无法创建单实例互斥锁：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(handle) };
+        return Ok(None);
+    }
+    Ok(Some(SingleInstanceGuard(handle as usize)))
+}
+
+#[cfg(not(windows))]
+struct SingleInstanceGuard;
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>, String> {
+    Ok(Some(SingleInstanceGuard))
+}
+
 fn terminate_and_reap(child: &Arc<Mutex<Child>>) {
     if let Ok(mut process) = child.lock() {
         if process.try_wait().ok().flatten().is_none() {
@@ -257,6 +298,7 @@ fn assign_kill_on_close_job(child: &Child) -> Result<JobHandle, String> {
     Ok(JobHandle(job as usize))
 }
 
+#[cfg(test)]
 fn read_frame(reader: &mut File, max: usize) -> std::io::Result<Value> {
     let mut raw = [0_u8; 4];
     reader.read_exact(&mut raw)?;
@@ -272,7 +314,7 @@ fn read_frame(reader: &mut File, max: usize) -> std::io::Result<Value> {
     serde_json::from_slice(&payload).map_err(std::io::Error::other)
 }
 
-fn write_frame(writer: &mut File, value: &Value, max: usize) -> std::io::Result<()> {
+fn encode_frame(value: &Value, max: usize) -> std::io::Result<Vec<u8>> {
     let payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     if payload.len() > max {
         return Err(std::io::Error::new(
@@ -280,9 +322,126 @@ fn write_frame(writer: &mut File, value: &Value, max: usize) -> std::io::Result<
             "bridge frame too large",
         ));
     }
-    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
-    writer.write_all(&payload)?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+fn write_encoded_frame(writer: &mut File, frame: &[u8]) -> std::io::Result<()> {
+    writer.write_all(frame)?;
     writer.flush()
+}
+
+#[cfg(test)]
+fn write_frame(writer: &mut File, value: &Value, max: usize) -> std::io::Result<()> {
+    write_encoded_frame(writer, &encode_frame(value, max)?)
+}
+
+#[cfg(windows)]
+fn pipe_available(pipe: &File) -> std::io::Result<usize> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut available = 0_u32;
+    let succeeded = unsafe {
+        PeekNamedPipe(
+            pipe.as_raw_handle() as _,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(available as usize)
+    }
+}
+
+#[cfg(not(windows))]
+fn pipe_available(_pipe: &File) -> std::io::Result<usize> {
+    Ok(65_536)
+}
+
+struct IncrementalFrameReader {
+    buffer: Vec<u8>,
+    frames: VecDeque<Value>,
+    max: usize,
+}
+
+impl IncrementalFrameReader {
+    fn new(max: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            frames: VecDeque::new(),
+            max,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.buffer.extend_from_slice(bytes);
+        loop {
+            if self.buffer.len() < 4 {
+                return Ok(());
+            }
+            let size = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
+            if size > self.max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bridge frame too large",
+                ));
+            }
+            let frame_size = 4 + size;
+            if self.buffer.len() < frame_size {
+                return Ok(());
+            }
+            let value = serde_json::from_slice(&self.buffer[4..frame_size])
+                .map_err(std::io::Error::other)?;
+            self.buffer.drain(..frame_size);
+            self.frames.push_back(value);
+        }
+    }
+
+    fn read_next(&mut self, reader: &mut File) -> std::io::Result<Value> {
+        if let Some(frame) = self.frames.pop_front() {
+            return Ok(frame);
+        }
+        loop {
+            let available = match pipe_available(reader) {
+                Ok(available) => available,
+                Err(error) if !self.buffer.is_empty() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("bridge closed with a truncated frame: {error}"),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if available == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let mut chunk = vec![0_u8; available.min(65_536)];
+            let count = reader.read(&mut chunk)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    if self.buffer.is_empty() {
+                        std::io::ErrorKind::BrokenPipe
+                    } else {
+                        std::io::ErrorKind::UnexpectedEof
+                    },
+                    "bridge pipe closed while reading a frame",
+                ));
+            }
+            self.feed(&chunk[..count])?;
+            if let Some(frame) = self.frames.pop_front() {
+                return Ok(frame);
+            }
+        }
+    }
 }
 
 fn spawn_log_reader<R: Read + Send + 'static>(
@@ -315,10 +474,20 @@ fn spawn_log_reader<R: Read + Send + 'static>(
 }
 
 #[cfg(windows)]
-fn create_pipe(name: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+#[derive(Clone, Copy)]
+enum PipeDirection {
+    HostWrites,
+    HostReads,
+}
+
+#[cfg(windows)]
+fn create_pipe(
+    name: &str,
+    direction: PipeDirection,
+) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
     };
     use windows_sys::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -327,7 +496,10 @@ fn create_pipe(name: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, Str
     let handle = unsafe {
         CreateNamedPipeW(
             wide.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            match direction {
+                PipeDirection::HostWrites => PIPE_ACCESS_OUTBOUND,
+                PipeDirection::HostReads => PIPE_ACCESS_INBOUND,
+            } | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1,
             65_536,
@@ -346,6 +518,11 @@ fn create_pipe(name: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, Str
     }
 }
 
+enum WriterCommand {
+    Frame(Vec<u8>),
+    Stop,
+}
+
 struct PendingRequest {
     sender: mpsc::SyncSender<PendingResult>,
     method: String,
@@ -355,7 +532,7 @@ struct PendingRequest {
 struct Bridge {
     generation: u64,
     child: Arc<Mutex<Child>>,
-    writer: Mutex<File>,
+    request_tx: mpsc::SyncSender<WriterCommand>,
     pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     lifecycle: Arc<Mutex<Lifecycle>>,
     last_request: Arc<Mutex<Option<(u64, String, bool)>>>,
@@ -390,8 +567,12 @@ impl Bridge {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let pipe_name = format!(
-                r"\\.\pipe\ethercat-workbench-{}-{nonce}",
+            let request_pipe_name = format!(
+                r"\\.\pipe\ethercat-workbench-request-{}-{nonce}",
+                std::process::id()
+            );
+            let response_pipe_name = format!(
+                r"\\.\pipe\ethercat-workbench-response-{}-{nonce}",
                 std::process::id()
             );
             let python =
@@ -402,11 +583,21 @@ impl Bridge {
                 paths.extend(std::env::split_paths(&existing));
             }
             let python_path = std::env::join_paths(paths).map_err(|e| e.to_string())?;
-            let pipe_handle = create_pipe(&pipe_name)?;
+            let request_handle = create_pipe(&request_pipe_name, PipeDirection::HostWrites)?;
+            let response_handle = match create_pipe(&response_pipe_name, PipeDirection::HostReads) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    unsafe { CloseHandle(request_handle) };
+                    return Err(error);
+                }
+            };
             command
                 .env("PYTHONPATH", python_path)
-                .env("ETHERCAT_WORKBENCH_PIPE", &pipe_name)
+                .env("ETHERCAT_WORKBENCH_REQUEST_PIPE", &request_pipe_name)
+                .env("ETHERCAT_WORKBENCH_RESPONSE_PIPE", &response_pipe_name)
                 .args(["-u", "-m", "ethercat_debug_tool.bridge"])
+                .arg("--workbench-host-root")
+                .arg(env!("CARGO_MANIFEST_DIR"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -415,7 +606,10 @@ impl Bridge {
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
-                    unsafe { CloseHandle(pipe_handle) };
+                    unsafe {
+                        CloseHandle(request_handle);
+                        CloseHandle(response_handle);
+                    }
                     return Err(format!("无法启动 Python EtherCAT 桥接进程：{error}"));
                 }
             };
@@ -424,45 +618,59 @@ impl Bridge {
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    unsafe { CloseHandle(pipe_handle) };
+                    unsafe {
+                        CloseHandle(request_handle);
+                        CloseHandle(response_handle);
+                    }
                     return Err(error);
                 }
             };
             let Some(stdout) = child.stdout.take() else {
                 let _ = child.kill();
                 let _ = child.wait();
-                unsafe { CloseHandle(pipe_handle) };
+                unsafe {
+                    CloseHandle(request_handle);
+                    CloseHandle(response_handle);
+                }
                 return Err("无法读取桥接 stdout 日志".into());
             };
             let Some(stderr) = child.stderr.take() else {
                 let _ = child.kill();
                 let _ = child.wait();
-                unsafe { CloseHandle(pipe_handle) };
+                unsafe {
+                    CloseHandle(request_handle);
+                    CloseHandle(response_handle);
+                }
                 return Err("无法读取桥接 stderr 日志".into());
             };
-            let (connect_tx, connect_rx) = mpsc::sync_channel(1);
-            let raw_handle = pipe_handle as usize;
-            std::thread::spawn(move || {
-                let handle = raw_handle as HANDLE;
-                let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
-                let result = connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
-                let _ = connect_tx.send(result);
+            let (connect_tx, connect_rx) = mpsc::sync_channel(2);
+            for raw_handle in [request_handle as usize, response_handle as usize] {
+                let connect_tx = connect_tx.clone();
+                std::thread::spawn(move || {
+                    let handle = raw_handle as HANDLE;
+                    let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+                    let result =
+                        connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+                    let _ = connect_tx.send(result);
+                });
+            }
+            drop(connect_tx);
+            let connect_deadline = Instant::now() + Duration::from_secs(10);
+            let connected = (0..2).all(|_| {
+                connect_rx.recv_timeout(connect_deadline.saturating_duration_since(Instant::now()))
+                    == Ok(true)
             });
-            if connect_rx.recv_timeout(Duration::from_secs(10)) != Ok(true) {
+            if !connected {
                 let _ = child.kill();
                 let _ = child.wait();
-                unsafe { CloseHandle(pipe_handle) };
-                return Err("Python 通信核心未在 10 秒内连接 Named Pipe".into());
-            }
-            let pipe = unsafe { File::from_raw_handle(pipe_handle as _) };
-            let reader = match pipe.try_clone() {
-                Ok(reader) => reader,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.to_string());
+                unsafe {
+                    CloseHandle(request_handle);
+                    CloseHandle(response_handle);
                 }
-            };
+                return Err("Python 通信核心未在 10 秒内连接两条 Named Pipe".into());
+            }
+            let request_pipe = unsafe { File::from_raw_handle(request_handle as _) };
+            let response_pipe = unsafe { File::from_raw_handle(response_handle as _) };
             let child = Arc::new(Mutex::new(child));
             let pending: Arc<Mutex<HashMap<u64, PendingRequest>>> =
                 Arc::new(Mutex::new(HashMap::new()));
@@ -472,6 +680,26 @@ impl Bridge {
             let log_path = app.path().app_log_dir().ok().map(|dir| {
                 let _ = fs::create_dir_all(&dir);
                 dir.join("python-bridge.log")
+            });
+
+            let (request_tx, request_rx) = mpsc::sync_channel::<WriterCommand>(64);
+            let writer_fault_tx = fault_tx.clone();
+            std::thread::spawn(move || {
+                let mut writer = request_pipe;
+                while let Ok(command) = request_rx.recv() {
+                    match command {
+                        WriterCommand::Frame(frame) => {
+                            if let Err(error) = write_encoded_frame(&mut writer, &frame) {
+                                let _ = writer_fault_tx.send(BridgeFault {
+                                    generation,
+                                    reason: format!("Named Pipe 请求写入失败：{error}"),
+                                });
+                                break;
+                            }
+                        }
+                        WriterCommand::Stop => break,
+                    }
+                }
             });
 
             let rp = Arc::clone(&pending);
@@ -485,9 +713,10 @@ impl Bridge {
             let reader_fault_tx = fault_tx.clone();
             let reader_generation_gate = Arc::clone(&generation_gate);
             std::thread::spawn(move || {
-                let mut reader = reader;
+                let mut reader = response_pipe;
+                let mut frame_reader = IncrementalFrameReader::new(max);
                 let reason = loop {
-                    match read_frame(&mut reader, max) {
+                    match frame_reader.read_next(&mut reader) {
                         Ok(msg) => match msg.get("type").and_then(Value::as_str) {
                             Some("accepted") => {
                                 if let Ok(mut s) = rl.lock() {
@@ -644,7 +873,7 @@ impl Bridge {
             Ok(Arc::new(Self {
                 generation,
                 child,
-                writer: Mutex::new(pipe),
+                request_tx,
                 pending,
                 lifecycle,
                 last_request,
@@ -656,14 +885,36 @@ impl Bridge {
     }
 
     fn request(&self, method: String, params: Value, session_id: Option<u64>) -> PendingResult {
-        let spec = self.registry.commands.get(&method).ok_or_else(|| {
-            bridge_error(
-                "VALIDATION",
-                format!("未注册命令：{method}"),
-                Some(&method),
-                false,
-            )
-        })?;
+        self.request_with_deadline(method, params, session_id, None, 2_000)
+    }
+
+    fn request_with_deadline(
+        &self,
+        method: String,
+        params: Value,
+        session_id: Option<u64>,
+        timeout_override_ms: Option<u64>,
+        host_grace_ms: u64,
+    ) -> PendingResult {
+        let (registered_timeout_ms, mutating) = self
+            .registry
+            .commands
+            .get(&method)
+            .map(|spec| (spec.timeout_ms, spec.mutating))
+            .ok_or_else(|| {
+                bridge_error(
+                    "VALIDATION",
+                    format!("未注册命令：{method}"),
+                    Some(&method),
+                    false,
+                )
+            })?;
+        let timeout_ms = timeout_override_ms.unwrap_or(registered_timeout_ms);
+        let created_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let deadline_at_ms = created_at_ms.saturating_add(timeout_ms);
         let state = self
             .lifecycle
             .lock()
@@ -677,55 +928,55 @@ impl Bridge {
                 "BRIDGE_UNAVAILABLE",
                 format!("通信核心状态：{}", state.label()),
                 Some(&method),
-                spec.mutating,
+                mutating,
             ));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(1);
+        let request = json!({"protocol":self.registry.protocol_version,"type":"request","id":id,"method":method,"params":params,"deadline_ms":timeout_ms,"deadline_at_ms":deadline_at_ms,"session_id":session_id});
+        let frame =
+            encode_frame(&request, self.registry.limits.max_frame_bytes).map_err(|error| {
+                bridge_error(
+                    "TRANSPORT_WRITE",
+                    format!("无法编码桥接请求：{error}"),
+                    Some(&method),
+                    mutating,
+                )
+            })?;
         self.pending
             .lock()
-            .map_err(|_| {
-                bridge_error(
-                    "INTERNAL",
-                    "请求表损坏".into(),
-                    Some(&method),
-                    spec.mutating,
-                )
-            })?
+            .map_err(|_| bridge_error("INTERNAL", "请求表损坏".into(), Some(&method), mutating))?
             .insert(
                 id,
                 PendingRequest {
                     sender: tx,
                     method: method.clone(),
-                    mutating: spec.mutating,
+                    mutating,
                 },
             );
         if let Ok(mut last) = self.last_request.lock() {
-            *last = Some((id, method.clone(), spec.mutating))
+            *last = Some((id, method.clone(), mutating))
         }
-        let deadline_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-            + spec.timeout_ms;
-        let request = json!({"protocol":self.registry.protocol_version,"type":"request","id":id,"method":method,"params":params,"deadline_ms":spec.timeout_ms,"deadline_at_ms":deadline_at_ms,"session_id":session_id});
-        if let Err(e) = self
-            .writer
-            .lock()
-            .map_err(|_| std::io::Error::other("pipe lock poisoned"))
-            .and_then(|mut w| write_frame(&mut w, &request, self.registry.limits.max_frame_bytes))
-        {
+        if let Err(error) = self.request_tx.try_send(WriterCommand::Frame(frame)) {
             if let Ok(mut p) = self.pending.lock() {
                 p.remove(&id);
             }
+            self.force_terminate("桥接请求无法进入发送队列");
             return Err(bridge_error(
-                "TRANSPORT_WRITE",
-                format!("发送桥接请求失败：{e}"),
+                "REQUEST_QUEUE",
+                format!("桥接请求无法进入发送队列：{error}"),
                 Some(&method),
-                spec.mutating,
+                mutating,
             ));
         }
-        match rx.recv_timeout(Duration::from_millis(spec.timeout_ms + 2_000)) {
+        let host_deadline_ms = deadline_at_ms.saturating_add(host_grace_ms);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        match rx.recv_timeout(Duration::from_millis(
+            host_deadline_ms.saturating_sub(now_ms),
+        )) {
             Ok(v) => v,
             Err(e) => {
                 if let Ok(mut p) = self.pending.lock() {
@@ -736,7 +987,7 @@ impl Bridge {
                     "HOST_TIMEOUT",
                     format!("桥接请求超时：{e}"),
                     Some(&method),
-                    spec.mutating,
+                    mutating,
                 ))
             }
         }
@@ -759,6 +1010,7 @@ impl Bridge {
             }
         }
         terminate_and_reap(&self.child);
+        let _ = self.request_tx.try_send(WriterCommand::Stop);
     }
 
     fn shutdown(&self) {
@@ -768,7 +1020,13 @@ impl Bridge {
             .map(|v| *v)
             .unwrap_or(Lifecycle::Exited);
         if !matches!(state, Lifecycle::Exited | Lifecycle::Stalled) {
-            let _ = self.request("shutdown".into(), Value::Object(Default::default()), None);
+            let _ = self.request_with_deadline(
+                "shutdown".into(),
+                Value::Object(Default::default()),
+                None,
+                Some(2_000),
+                0,
+            );
         }
         if let Ok(mut s) = self.lifecycle.lock() {
             *s = Lifecycle::Stopping
@@ -1044,6 +1302,17 @@ fn open_external(url: String) -> Result<(), String> {
 }
 
 fn main() {
+    let _single_instance = match acquire_single_instance() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            eprintln!("EtherCAT Workbench 已在运行；本次启动已退出。");
+            return;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return;
+        }
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -1091,6 +1360,21 @@ mod tests {
             std::io::ErrorKind::UnexpectedEof
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn incremental_reader_waits_for_a_complete_frame_and_keeps_following_frames() {
+        let first = encode_frame(&json!({"id": 1}), 1024).unwrap();
+        let second = encode_frame(&json!({"id": 2}), 1024).unwrap();
+        let mut reader = IncrementalFrameReader::new(1024);
+
+        reader.feed(&first[..3]).unwrap();
+        assert!(reader.frames.is_empty());
+        reader.feed(&first[3..]).unwrap();
+        reader.feed(&second).unwrap();
+
+        assert_eq!(reader.frames.pop_front().unwrap()["id"], 1);
+        assert_eq!(reader.frames.pop_front().unwrap()["id"], 2);
     }
 
     #[test]
@@ -1242,8 +1526,8 @@ mod tests {
         use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
 
         let name = format!(r"\\.\pipe\ec-frame-test-{}", std::process::id());
-        let handle = create_pipe(&name).unwrap();
-        let script = "import json,os,struct; p=open(os.environ['PIPE'],'r+b',buffering=0); b=json.dumps({'type':'heartbeat'}).encode(); p.write(struct.pack('<I',len(b))+b); p.close()";
+        let handle = create_pipe(&name, PipeDirection::HostReads).unwrap();
+        let script = "import json,os,struct; p=open(os.environ['PIPE'],'wb',buffering=0); b=json.dumps({'type':'heartbeat'}).encode(); p.write(struct.pack('<I',len(b))+b); p.close()";
         let mut child = Command::new("python")
             .args(["-c", script])
             .env("PIPE", &name)
@@ -1256,6 +1540,44 @@ mod tests {
         assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
         let mut pipe = unsafe { File::from_raw_handle(handle as _) };
         assert_eq!(read_frame(&mut pipe, 1024).unwrap()["type"], "heartbeat");
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn separate_request_and_response_pipes_exchange_a_frame() {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_CONNECTED};
+        use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let request_name = format!(r"\\.\pipe\ec-request-test-{}-{nonce}", std::process::id());
+        let response_name = format!(r"\\.\pipe\ec-response-test-{}-{nonce}", std::process::id());
+        let request_handle = create_pipe(&request_name, PipeDirection::HostWrites).unwrap();
+        let response_handle = create_pipe(&response_name, PipeDirection::HostReads).unwrap();
+        let script = "import json,os,struct; r=open(os.environ['REQUEST'],'rb',buffering=0); w=open(os.environ['RESPONSE'],'wb',buffering=0); n=struct.unpack('<I',r.read(4))[0]; q=json.loads(r.read(n)); b=json.dumps({'type':'response','id':q['id']}).encode(); w.write(struct.pack('<I',len(b))+b); r.close(); w.close()";
+        let mut child = Command::new("python")
+            .args(["-c", script])
+            .env("REQUEST", &request_name)
+            .env("RESPONSE", &response_name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let connected = unsafe { ConnectNamedPipe(request_handle, std::ptr::null_mut()) };
+        assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
+        let connected = unsafe { ConnectNamedPipe(response_handle, std::ptr::null_mut()) };
+        assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
+        let mut request_pipe = unsafe { File::from_raw_handle(request_handle as _) };
+        let mut response_pipe = unsafe { File::from_raw_handle(response_handle as _) };
+        write_frame(&mut request_pipe, &json!({"type":"request","id":7}), 1024).unwrap();
+        let mut reader = IncrementalFrameReader::new(1024);
+        let response = reader.read_next(&mut response_pipe).unwrap();
+        assert_eq!(response["id"], 7);
         assert!(child.wait().unwrap().success());
     }
 }

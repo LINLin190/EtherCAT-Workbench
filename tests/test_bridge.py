@@ -12,9 +12,10 @@ import pytest
 from ethercat_debug_tool.bridge import (
     BridgeRuntime,
     EepromExclusiveError,
-    _auto_scan_adapters,
     _handle_request,
     _json_value,
+    _ordered_adapters,
+    _scan_adapter,
     _structured_error,
 )
 from ethercat_debug_tool.command_registry import load_command_registry
@@ -70,11 +71,19 @@ class MultiAdapterBackend:
 def test_auto_scan_prioritizes_preferred_adapter_and_stops_on_first_slave() -> None:
     backend = MultiAdapterBackend("adapter-c")
 
-    result = _auto_scan_adapters(backend, "adapter-b")
+    attempts = []
+    selected = ""
+    slaves: list[str] = []
+    for item in _ordered_adapters(backend.enumerate_adapters(), "adapter-b"):
+        attempt, slaves = _scan_adapter(backend, item.name)
+        attempts.append(attempt)
+        if slaves:
+            selected = item.name
+            break
 
-    assert result["selected_adapter"] == "adapter-c"
-    assert result["connected"] is True
-    assert result["slaves"] == ["slave"]
+    assert selected == "adapter-c"
+    assert slaves == ["slave"]
+    assert all(attempt["elapsed_ms"] >= 0 for attempt in attempts)
     assert backend.calls == [
         "connect:adapter-b",
         "scan:adapter-b",
@@ -87,15 +96,58 @@ def test_auto_scan_prioritizes_preferred_adapter_and_stops_on_first_slave() -> N
     ]
 
 
+def test_auto_scan_prioritizes_physical_ethernet_before_virtual_adapters() -> None:
+    class OrderedBackend(MultiAdapterBackend):
+        def enumerate_adapters(self) -> list[AdapterInfo]:
+            return [
+                AdapterInfo("wifi", "Qualcomm Wireless Adapter"),
+                AdapterInfo("ethernet", "Realtek PCIe GbE Family Controller"),
+                AdapterInfo("vm", "VMware Virtual Ethernet Adapter"),
+            ]
+
+    backend = OrderedBackend("ethernet")
+
+    ordered = _ordered_adapters(backend.enumerate_adapters())
+    attempt, slaves = _scan_adapter(backend, ordered[0].name)
+
+    assert ordered[0].name == "ethernet"
+    assert attempt["slave_count"] == 1
+    assert slaves == ["slave"]
+    assert backend.calls == ["connect:ethernet", "scan:ethernet"]
+
+
 def test_auto_scan_restores_preferred_selection_and_disconnects_when_empty() -> None:
     backend = MultiAdapterBackend(None)
 
-    result = _auto_scan_adapters(backend, "adapter-b")
+    attempts = [
+        _scan_adapter(backend, item.name)[0]
+        for item in _ordered_adapters(backend.enumerate_adapters(), "adapter-b")
+    ]
 
-    assert result["selected_adapter"] == "adapter-b"
-    assert result["connected"] is False
-    assert result["slaves"] == []
+    assert attempts[0]["adapter"] == "adapter-b"
+    assert all(attempt["slave_count"] == 0 for attempt in attempts)
     assert backend.connected is False
+
+
+def test_auto_scan_records_adapter_timeout_before_faulting_worker(monkeypatch, tmp_path) -> None:
+    writer = RecordingWriter()
+    runtime = BridgeRuntime(writer, BackendMode.DEMO, audit_path=tmp_path / "audit.jsonl")
+
+    def submit(operation, *args, **kwargs):
+        if operation == "enumerate_adapters":
+            return [AdapterInfo("ethernet", "Realtek PCIe GbE Family Controller")]
+        raise TimeoutError("simulated native timeout")
+
+    monkeypatch.setattr(runtime, "_submit", submit)
+    try:
+        with pytest.raises(TimeoutError, match="Realtek PCIe GbE Family Controller"):
+            runtime.dispatch("auto_scan", {})
+        timeout_events = [payload for kind, payload in writer.events if kind == "auto_scan_attempt"]
+        assert timeout_events[-1]["adapter"] == "ethernet"
+        assert timeout_events[-1]["timed_out"] is True
+        assert timeout_events[-1]["state"] == "timed_out"
+    finally:
+        runtime.shutdown()
 
 
 def test_bridge_demo_core_commands(tmp_path) -> None:

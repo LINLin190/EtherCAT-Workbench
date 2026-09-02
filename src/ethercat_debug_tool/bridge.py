@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import itertools
 import json
 import os
+import queue
+import re
 import sys
 import threading
 import time
@@ -20,7 +23,7 @@ from .backends.pysoem_backend import PysoemBackend
 from .command_registry import CommandSpec, load_command_registry
 from .esc_profiles.profiles import ProfileRegistry
 from .esi import EsiParser
-from .framing import FrameError, read_frame, write_frame
+from .framing import FrameError, IncrementalFrameReader, write_frame
 from .infrastructure import AuditLogger, default_audit_path
 from .master_state import MasterStateMachine, StaleMasterSession
 from .models import AccessSemantics, BackendMode, EtherCatState, OperationProgress, PdoDirection
@@ -30,6 +33,8 @@ from .sii.generator import SiiGenerationReport, SiiGenerator
 from .sii.parser import SiiParser
 from .worker import EtherCatWorker
 from .worker.ethercat_worker import Priority
+
+AUTO_SCAN_ADAPTER_TIMEOUT_S = 4.0
 
 
 def _json_value(value: Any) -> Any:
@@ -50,68 +55,122 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def _auto_scan_adapters(backend: Any, preferred_adapter: str = "") -> dict[str, Any]:
-    """Scan adapters in priority order and leave only a successful adapter connected."""
-    adapters = list(backend.enumerate_adapters())
-    ordered = list(adapters)
+def _ordered_adapters(adapters: list[Any], preferred_adapter: str = "") -> list[Any]:
+    virtual = re.compile(r"\b(wan miniport|wi-?fi|wireless|loopback|vmware|virtual|wintun|tunnel)\b", re.I)
+    ethernet = re.compile(r"\b(ethernet|gbe|gigabit|i21\d|realtek|ethercat)\b", re.I)
+
+    def adapter_priority(item: Any) -> int:
+        description = str(getattr(item, "description", ""))
+        if virtual.search(description):
+            return 2
+        if ethernet.search(description):
+            return 0
+        return 1
+
+    ordered = sorted(adapters, key=adapter_priority)
     preferred = next((item for item in adapters if item.name == preferred_adapter), None)
     if preferred is not None:
-        ordered = [preferred, *(item for item in adapters if item.name != preferred_adapter)]
+        ordered = [preferred, *(item for item in ordered if item.name != preferred_adapter)]
+    return ordered
 
+
+def _scan_adapter(backend: Any, adapter_name: str) -> tuple[dict[str, Any], list[Any]]:
+    """Run one bounded-by-caller adapter attempt and leave it connected only on success."""
+    started = time.perf_counter()
+    attempt: dict[str, Any] = {"adapter": adapter_name, "slave_count": 0}
+    slaves: list[Any] = []
     if backend.connected:
         backend.disconnect()
-
-    attempts: list[dict[str, Any]] = []
-    for item in ordered:
-        try:
-            backend.connect(item.name)
-            slaves = list(backend.scan())
-        except Exception as exc:
-            attempts.append({"adapter": item.name, "slave_count": 0, "error": str(exc)})
-            if backend.connected:
-                try:
-                    backend.disconnect()
-                except Exception as disconnect_exc:
-                    attempts[-1]["disconnect_error"] = str(disconnect_exc)
-            continue
-
-        attempts.append({"adapter": item.name, "slave_count": len(slaves)})
-        if slaves:
-            return {
-                "adapters": adapters,
-                "selected_adapter": item.name,
-                "connected": True,
-                "slaves": slaves,
-                "attempts": attempts,
-            }
-        backend.disconnect()
-
-    selected = preferred.name if preferred is not None else (adapters[0].name if adapters else "")
-    return {
-        "adapters": adapters,
-        "selected_adapter": selected,
-        "connected": False,
-        "slaves": [],
-        "attempts": attempts,
-    }
+    try:
+        backend.connect(adapter_name)
+        slaves = list(backend.scan())
+        attempt["slave_count"] = len(slaves)
+    except Exception as exc:
+        attempt["error"] = str(exc)
+    finally:
+        if not slaves and backend.connected:
+            try:
+                backend.disconnect()
+            except Exception as exc:
+                attempt["disconnect_error"] = str(exc)
+        attempt["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
+    return attempt, slaves
 
 
 class JsonWriter:
-    """Thread-safe protocol writer; stdout is intentionally never used for IPC."""
+    """Single-owner response-pipe writer with bounded, non-blocking producers."""
 
     def __init__(self, stream: Any | None = None, max_frame_bytes: int | None = None) -> None:
-        self._lock = threading.Lock()
         self._stream = stream
         self._max_frame_bytes = max_frame_bytes or load_command_registry().max_frame_bytes
+        self._queue: queue.PriorityQueue[tuple[int, int, dict[str, Any] | None]] = (
+            queue.PriorityQueue(maxsize=128)
+        )
+        self._sequence = itertools.count()
+        self._failed = threading.Event()
+        self._error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        if stream is not None:
+            self._thread = threading.Thread(
+                target=self._run, name="Bridge response writer", daemon=True
+            )
+            self._thread.start()
+
+    @property
+    def failed(self) -> bool:
+        return self._failed.is_set()
+
+    @property
+    def error(self) -> BaseException | None:
+        return self._error
+
+    def _run(self) -> None:
+        assert self._stream is not None
+        try:
+            while True:
+                _, _, message = self._queue.get()
+                try:
+                    if message is None:
+                        return
+                    write_frame(self._stream, message, self._max_frame_bytes)
+                finally:
+                    self._queue.task_done()
+        except BaseException as exc:
+            self._error = exc
+            self._failed.set()
+        finally:
+            try:
+                self._stream.close()
+            except OSError:
+                pass
 
     def send(self, message: dict[str, Any]) -> None:
         safe = _json_value(message)
-        with self._lock:
-            if self._stream is None:
-                # Kept only as an injectable test sink. Production always supplies
-                # the dedicated named-pipe stream.
-                return
-            write_frame(self._stream, safe, self._max_frame_bytes)
+        if self._stream is None:
+            # Kept only as an injectable test sink. Production always supplies
+            # the dedicated response pipe.
+            return
+        if self._failed.is_set():
+            raise OSError(f"response pipe writer failed: {self._error}")
+        is_heartbeat = safe.get("type") == "event" and safe.get("payload", {}).get("kind") == "heartbeat"
+        item = (1 if is_heartbeat else 0, next(self._sequence), safe)
+        try:
+            if is_heartbeat:
+                self._queue.put_nowait(item)
+            else:
+                self._queue.put(item, timeout=0.25)
+        except queue.Full:
+            if not is_heartbeat:
+                raise RuntimeError("response pipe queue is full") from None
+
+    def close(self, timeout: float = 1.0) -> None:
+        if self._thread is None or self._failed.is_set():
+            return
+        try:
+            self._queue.put((2, next(self._sequence), None), timeout=0.25)
+        except queue.Full:
+            return
+        self._thread.join(timeout)
 
     def event(self, kind: str, payload: Any, session_id: int | None = None) -> None:
         event = {"kind": kind, "data": payload}
@@ -329,6 +388,7 @@ class BridgeRuntime:
         *args: Any,
         priority: Priority = Priority.NORMAL,
         timeout: float = 15.0,
+        fault_on_timeout: bool = True,
         **kwargs: Any,
     ) -> Any:
         with self._worker_lock:
@@ -349,9 +409,70 @@ class BridgeRuntime:
             # A queued task can be cancelled safely. If it is already running,
             # pySOEM may still be blocked in native code; fail subsequent requests
             # immediately instead of building a minutes-long queue behind it.
-            if not future.cancel():
+            if not future.cancel() and fault_on_timeout:
                 self._fault_worker(f"EtherCAT Worker 操作超时（{timeout:g} 秒）")
             raise TimeoutError(f"EtherCAT Worker 操作超时（{timeout:g} 秒）") from exc
+
+    def _auto_scan(self, preferred_adapter: str) -> dict[str, Any]:
+        adapters = list(self._submit("enumerate_adapters"))
+        ordered = _ordered_adapters(adapters, preferred_adapter)
+        attempts: list[dict[str, Any]] = []
+        for item in ordered:
+            description = str(getattr(item, "description", "") or item.name)
+            self.writer.event(
+                "auto_scan_attempt",
+                {"adapter": item.name, "description": description, "state": "started"},
+                self.session_id,
+            )
+            started = time.perf_counter()
+            try:
+                attempt, slaves = self._submit(
+                    lambda backend, name=item.name: _scan_adapter(backend, name),
+                    timeout=AUTO_SCAN_ADAPTER_TIMEOUT_S,
+                    fault_on_timeout=False,
+                )
+            except TimeoutError as exc:
+                attempt = {
+                    "adapter": item.name,
+                    "slave_count": 0,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                    "timed_out": True,
+                    "error": f"网卡 {description} 探测超过 {AUTO_SCAN_ADAPTER_TIMEOUT_S:g} 秒",
+                }
+                attempts.append(attempt)
+                self.writer.event(
+                    "auto_scan_attempt",
+                    {**attempt, "description": description, "state": "timed_out"},
+                    self.session_id,
+                )
+                self._fault_worker(attempt["error"])
+                raise TimeoutError(attempt["error"]) from exc
+
+            attempts.append(attempt)
+            self.writer.event(
+                "auto_scan_attempt",
+                {**attempt, "description": description, "state": "completed"},
+                self.session_id,
+            )
+            if slaves:
+                return {
+                    "adapters": adapters,
+                    "selected_adapter": item.name,
+                    "connected": True,
+                    "slaves": slaves,
+                    "attempts": attempts,
+                }
+
+        selected = preferred_adapter if any(item.name == preferred_adapter for item in adapters) else ""
+        if not selected and ordered:
+            selected = ordered[0].name
+        return {
+            "adapters": adapters,
+            "selected_adapter": selected,
+            "connected": False,
+            "slaves": [],
+            "attempts": attempts,
+        }
 
     def _progress(self, progress: OperationProgress) -> None:
         self.writer.event("progress", progress, self._active_hardware_session)
@@ -495,7 +616,7 @@ class BridgeRuntime:
                 raise RuntimeError("自动扫描前必须先断开当前网卡")
             preferred = str(params.get("preferred_adapter") or "")
             try:
-                result = self._submit(lambda backend: _auto_scan_adapters(backend, preferred), timeout=60)
+                result = self._auto_scan(preferred)
             except BaseException as exc:
                 if not self._worker_stalled:
                     self.master_state.connect_failed(str(exc))
@@ -1136,11 +1257,11 @@ def _handle_request(
             request_slots.release()
 
 
-def _open_pipe(path: str, timeout_s: float = 10.0) -> Any:
+def _open_pipe(path: str, *, mode: str, timeout_s: float = 10.0) -> Any:
     deadline = time.monotonic() + timeout_s
     while True:
         try:
-            return open(path, "r+b", buffering=0)
+            return open(path, mode, buffering=0)
         except OSError:
             if time.monotonic() >= deadline:
                 raise
@@ -1161,13 +1282,20 @@ def _heartbeat(runtime: BridgeRuntime, writer: JsonWriter, stopped: threading.Ev
 
 
 def main() -> int:
-    pipe_name = os.environ.get("ETHERCAT_WORKBENCH_PIPE")
-    if not pipe_name:
-        print("ETHERCAT_WORKBENCH_PIPE is required", file=sys.stderr, flush=True)
+    request_pipe_name = os.environ.get("ETHERCAT_WORKBENCH_REQUEST_PIPE")
+    response_pipe_name = os.environ.get("ETHERCAT_WORKBENCH_RESPONSE_PIPE")
+    if not request_pipe_name or not response_pipe_name:
+        print(
+            "ETHERCAT_WORKBENCH_REQUEST_PIPE and ETHERCAT_WORKBENCH_RESPONSE_PIPE are required",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
     registry = load_command_registry()
-    stream = _open_pipe(pipe_name)
-    writer = JsonWriter(stream, registry.max_frame_bytes)
+    request_stream = _open_pipe(request_pipe_name, mode="rb")
+    response_stream = _open_pipe(response_pipe_name, mode="wb")
+    reader = IncrementalFrameReader(registry.max_frame_bytes)
+    writer = JsonWriter(response_stream, registry.max_frame_bytes)
     mode = BackendMode(os.environ.get("ETHERCAT_WORKBENCH_MODE", BackendMode.REAL.value))
     runtime = BridgeRuntime(writer, mode, audit_path=default_audit_path())
     stopped = threading.Event()
@@ -1192,7 +1320,7 @@ def main() -> int:
     try:
         while True:
             try:
-                request = read_frame(stream, registry.max_frame_bytes)
+                request = reader.read(request_stream, stopped=lambda: writer.failed)
             except (FrameError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 writer.event("protocol_error", str(exc))
                 continue
@@ -1249,7 +1377,8 @@ def main() -> int:
         runtime.shutdown()
         for pool in pools.values():
             pool.shutdown(wait=False, cancel_futures=True)
-        stream.close()
+        writer.close()
+        request_stream.close()
     return 0
 
 

@@ -46,6 +46,8 @@ export interface WorkbenchStatus {
 export interface AutoScanAttempt {
   adapter: string;
   slave_count: number;
+  elapsed_ms: number;
+  timed_out?: boolean;
   error?: string;
   disconnect_error?: string;
 }
