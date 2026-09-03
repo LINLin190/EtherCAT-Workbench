@@ -70,7 +70,7 @@ class EepromService:
         self,
         backend: EtherCatBackend,
         *,
-        stability_wait_s: float = 10.0,
+        stability_wait_s: float = 1.0,
         rediscovery_timeout_s: float = 5.0,
         rediscovery_poll_s: float = 0.25,
         sleep: Callable[[float], None] = time.sleep,
