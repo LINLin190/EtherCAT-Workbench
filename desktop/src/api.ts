@@ -282,12 +282,26 @@ class PreviewBridge {
         this.scanned = [];
         this.advanceSession();
         return { reset_sequence: [true, true, true] } as T;
+      case "esi_library_list":
+        return {
+          directory: "D:\\EtherCAT Workbench\\xml列表",
+          errors: [],
+          entries: [
+            { path: "D:\\EtherCAT Workbench\\xml列表\\Demo-IO-SPI.xml", sha256: "preview-spi", vendor_id: 2, vendor_name: "Demo Automation", ordinal: 0, device_name: "Demo EtherCAT Device · SPI", type_name: "Demo-IO", product_code: 0x12345678, revision: 0x00010000, byte_size: 2048, config_data: "05 0E 03 44 0A 00 00 00 00 00" },
+            { path: "D:\\EtherCAT Workbench\\xml列表\\Demo-IO-HBI.xml", sha256: "preview-hbi", vendor_id: 2, vendor_name: "Demo Automation", ordinal: 0, device_name: "Demo EtherCAT Device · HBI", type_name: "Demo-IO", product_code: 0x12345678, revision: 0x00010000, byte_size: 2048, config_data: "8D 0E 03 44 0A 00 00 00 00 00" },
+          ],
+        } as T;
       case "esi_load": {
-        const device: EsiDevice = { name: "Demo EtherCAT Device", type_name: "Demo-IO", product_code: 0x12345678, revision_number: 0x00010000, serial_number: 0, eeprom_byte_size: 2048 };
+        const hbi = String(params.path ?? "").toLowerCase().includes("hbi");
+        const device: EsiDevice = { name: hbi ? "Demo EtherCAT Device · HBI" : "Demo EtherCAT Device · SPI", type_name: "Demo-IO", product_code: 0x12345678, revision_number: 0x00010000, serial_number: 0, eeprom_byte_size: 2048, config_data: hbi ? "8D 0E 03 44 0A 00 00 00 00 00" : "05 0E 03 44 0A 00 00 00 00 00" };
         return { document_id: "preview-document", path: params.path, sha256: "preview", vendor_id: 2, vendor_name: "Demo Automation", devices: [device] } as T;
       }
-      case "sii_generate":
-        return { target_id: "preview-target", size: 2048, sha256: "9f3b…d120", supported: ["Identity", "Strings", "PDO", "FMMU", "SyncM"], omitted: ["Vendor category 0x9000"], layout: [{ name: "Fixed SII area", offset: 0, length: 128, content: "00 00 00 00" }, { kind: 0x000A, name: "Strings", offset: 128, length: 42, content: "02 0B 44 65 6D 6F" }, { kind: 0xFFFF, name: "End marker", offset: 512, length: 2, content: "FF FF" }], device: { name: "Demo EtherCAT Device", product_code: 0x12345678, revision_number: 0x10000 } } as T;
+      case "sii_generate": {
+        const configData = String(params.config_data ?? "05 0E 03 44 0A 00 00 00 00 00");
+        return { target_id: `preview-target-${configData.replaceAll(" ", "")}`, size: 2048, sha256: "9f3b…d120", supported: ["Identity", "Strings", "PDO", "FMMU", "SyncM"], omitted: ["Vendor category 0x9000"], layout: [{ name: "Fixed SII area", offset: 0, length: 128, content: `${configData} 00 00 00 00 B6 00` }, { kind: 0x000A, name: "Strings", offset: 128, length: 42, content: "02 0B 44 65 6D 6F" }, { kind: 0xFFFF, name: "End marker", offset: 512, length: 2, content: "FF FF" }], device: { name: "Demo EtherCAT Device", product_code: 0x12345678, revision_number: 0x10000, config_data: configData }, original_config_data: "05 0E 03 44 0A 00 00 00 00 00", effective_config_data: configData } as T;
+      }
+      case "eeprom_header":
+        return { header: "05 0E 03 44 0A 00 00 00 00 00 00 00 00 00 B6 00", config_data: "05 0E 03 44 0A 00 00 00 00 00", crc_valid: true, size: 2048 } as T;
       case "eeprom_read":
         return {
           data: "FF ".repeat(2048).trim(),
@@ -312,6 +326,9 @@ class PreviewBridge {
         return { binary_path: `${params.directory}\\slave-2-eeprom.bin`, size: 2048, sha256: "6ad4…51c2" } as T;
       case "eeprom_flash":
       case "eeprom_restore":
+        this.scanned = this.scanned.map((slave) => slave.position === Number(params.position) ? { ...slave, state: 1 } : slave);
+        this.emit("slaves_changed", this.scanned);
+        this.emit("progress", { operation: "eeprom-flash", stage: "prepare-init", completed: 1, total: 1, detail: "目标从站已切换到 INIT", cancellable: false });
         for (const completed of [10, 35, 68, 100]) {
           this.emit("progress", { operation: "eeprom-flash", stage: completed < 100 ? "write-verify" : "full-verify", completed, total: 100, detail: `${completed}%`, cancellable: false });
         }

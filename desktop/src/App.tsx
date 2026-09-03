@@ -67,6 +67,8 @@ import packageInfo from "../package.json";
 import { alStatusInfo, type AlStatusLanguage } from "./alStatus";
 import { BridgeRequestError, bridgeRequest, onBridgeEvent, onBridgeExited, onFileDrop, openExternal, pickDirectory, pickFile, previewMode, revealPath, subscribeBusSnapshot, type AdapterInfo } from "./api";
 import { operationStore } from "./operationStore";
+import { decodeConfigData, normalizeConfigData } from "./eepromConfig";
+import { QuickEepromFlashDialog, type EepromDetailSelection, type EepromProgressState } from "./QuickEepromFlashDialog";
 import type {
   BridgeEvent,
   BridgeExitInfo,
@@ -556,8 +558,8 @@ function RegistersPage({ slave, run, registerProfile }: { slave?: SlaveInfo; run
 
 interface EsiResult { document_id: string; path: string; vendor_id: number; vendor_name: string; devices: EsiDevice[] }
 interface SiiLayoutItem { kind?: number; name: string; offset: number; length: number; content: string }
-interface TargetResult { target_id: string; size: number; sha256: string; supported: string[]; omitted: string[]; device: EsiDevice; layout: SiiLayoutItem[] }
-interface ProgressState extends OperationProgress { percent: number; tone?: "error" | "success" | "info" }
+interface TargetResult { target_id: string; size: number; sha256: string; supported: string[]; omitted: string[]; device: EsiDevice; layout: SiiLayoutItem[]; original_config_data?: string; effective_config_data?: string }
+type ProgressState = EepromProgressState;
 interface EepromComparisonResult { equal: boolean; differing_bytes: number; first_difference?: number; target_sha256: string; readback_sha256: string }
 interface EepromReadResult { data: string; size: number; sha256: string; read_at: string; sii_valid: boolean; sii_error?: string; identity?: { vendor_id: number; product_code: number; revision: number; serial_number: number }; category_count?: number; categories?: number[]; end_offset?: number; comparison?: EepromComparisonResult }
 interface EepromFlashDetails { bytes_read_back: number; words_written: number; comparison: EepromComparisonResult; sii_valid: boolean; semantic_valid: boolean; image_verification: string; reset_sequence?: boolean[]; rediscovered?: boolean; reload_verified?: boolean }
@@ -596,7 +598,24 @@ function deviceRevision(device: EsiDevice): number {
   return Number(device.revision ?? device.revision_number ?? 0);
 }
 
-function EepromPage({ slave, status, progress, setProgress, run }: { slave?: SlaveInfo; status: WorkbenchStatus; progress?: ProgressState; setProgress: (value?: ProgressState) => void; run: Run }) {
+function deviceConfigData(device?: EsiDevice): string {
+  const value = typeof device?.config_data === "string" ? device.config_data : "";
+  return normalizeConfigData(value).formatted ?? "";
+}
+
+interface EepromPageProps {
+  slave?: SlaveInfo;
+  status: WorkbenchStatus;
+  progress?: ProgressState;
+  setProgress: (value?: ProgressState) => void;
+  run: Run;
+  readResult?: EepromReadResult;
+  setReadResult: (value?: EepromReadResult) => void;
+  initialSelection?: EepromDetailSelection;
+  onInitialSelectionConsumed: () => void;
+}
+
+function EepromPage({ slave, status, progress, setProgress, run, readResult, setReadResult, initialSelection, onInitialSelectionConsumed }: EepromPageProps) {
   const [esi, setEsi] = useState<EsiResult>();
   const [ordinal, setOrdinal] = useState(0);
   const [target, setTarget] = useState<TargetResult>();
@@ -608,33 +627,39 @@ function EepromPage({ slave, status, progress, setProgress, run }: { slave?: Sla
     try { return JSON.parse(window.localStorage.getItem(RECENT_ESI_KEY) ?? "[]") as string[]; }
     catch { return []; }
   });
-  const [readResult, setReadResult] = useState<EepromReadResult>();
+  const [configData, setConfigData] = useState("");
+  const [originalConfigData, setOriginalConfigData] = useState("");
   const [operationResult, setOperationResult] = useState<EepromOperationResult>();
   const generationRequestRef = useRef(0);
+  const generatedConfigRef = useRef("");
   const autoMatchContextRef = useRef("");
   const currentDevice = esi?.devices[ordinal];
+  const configDataResult = normalizeConfigData(configData);
+  const configDecoded = decodeConfigData(configData);
   const operationInProgress = isEepromOperation(progress?.operation) && progress!.percent < 100;
   const capacityKnown = physicalSize !== undefined && !capacityError;
   const capacityMatches = Boolean(target && capacityKnown && target.size === physicalSize);
   const capacityState = !target ? "uncompared" : !capacityKnown ? "unknown" : capacityMatches ? "matched" : "mismatched";
   const identityMismatches = identityMismatchReasons(slave, esi, currentDevice);
   const identityMismatch = identityMismatches.length > 0;
-  const canFlash = Boolean(slave && target && capacityMatches && !status.cycle_running && slave.state === 1 && !operationInProgress);
-  const blockers = [operationInProgress && "已有 EEPROM 操作正在执行", !target && "需要选择有效 XML", !capacityKnown && "需要成功读取物理 EEPROM 容量", target && capacityKnown && !capacityMatches && "目标容量与物理 EEPROM 不一致", status.cycle_running && "需要停止周期通信", slave?.state !== 1 && "需要将从站切换到 INIT"].filter(Boolean) as string[];
+  const canFlash = Boolean(slave && target && capacityMatches && !status.cycle_running && !operationInProgress);
+  const blockers = [operationInProgress && "已有 EEPROM 操作正在执行", !target && "需要选择有效 XML", !capacityKnown && "需要成功读取物理 EEPROM 容量", target && capacityKnown && !capacityMatches && "目标容量与物理 EEPROM 不一致", status.cycle_running && "需要停止周期通信"].filter(Boolean) as string[];
   useEffect(() => {
     let active = true;
-    setPhysicalSize(undefined); setCapacityError(""); setReadResult(undefined); setOperationResult(undefined); setBackupPath("");
+    setPhysicalSize(undefined); setCapacityError(""); setOperationResult(undefined); setBackupPath("");
     if (slave) bridgeRequest<{ size: number }>("eeprom_capacity", { position: slave.position })
       .then((value) => { if (active) setPhysicalSize(value.size); })
       .catch((error) => { if (active) setCapacityError(error instanceof Error ? error.message : String(error)); });
     return () => { active = false; };
   }, [slaveIdentityKey(slave)]);
 
-  const generate = useCallback(async (document: EsiResult, selectedOrdinal: number) => {
+  const generate = useCallback(async (document: EsiResult, selectedOrdinal: number, effectiveConfig?: string) => {
     const requestId = ++generationRequestRef.current;
+    const normalized = normalizeConfigData(effectiveConfig ?? deviceConfigData(document.devices[selectedOrdinal])).formatted;
+    generatedConfigRef.current = normalized ?? "";
     setTarget(undefined); setOperationResult(undefined); setGenerationError("");
     const value = await run(async () => {
-      try { return await bridgeRequest<TargetResult>("sii_generate", { document_id: document.document_id, ordinal: selectedOrdinal }); }
+      try { return await bridgeRequest<TargetResult>("sii_generate", { document_id: document.document_id, ordinal: selectedOrdinal, ...(normalized ? { config_data: normalized } : {}) }); }
       catch (error) {
         if (generationRequestRef.current === requestId) setGenerationError(error instanceof Error ? error.message : String(error));
         throw error;
@@ -653,12 +678,15 @@ function EepromPage({ slave, status, progress, setProgress, run }: { slave?: Sla
       deviceRevision(device) === slave.identity.revision,
     );
     if (matched >= 0) {
+      const nextConfig = deviceConfigData(esi.devices[matched]);
       setOrdinal(matched);
-      void generate(esi, matched);
+      setOriginalConfigData(nextConfig);
+      setConfigData(nextConfig);
+      void generate(esi, matched, nextConfig);
     }
   }, [esi, generate, slaveIdentityKey(slave)]);
 
-  const loadXml = useCallback(async (path: string) => {
+  const loadXml = useCallback(async (path: string, preferredOrdinal?: number, overrideConfig?: string) => {
     const document = await run(() => bridgeRequest<EsiResult>("esi_load", { path }));
     if (document) {
       const nextRecent = [path, ...recentEsi.filter((item) => item !== path)].slice(0, 5);
@@ -667,11 +695,18 @@ function EepromPage({ slave, status, progress, setProgress, run }: { slave?: Sla
       const matched = slave ? document.devices.findIndex((device) =>
         document.vendor_id === slave.identity.vendor_id && device.product_code === slave.identity.product_code && deviceRevision(device) === slave.identity.revision,
       ) : -1;
-      const selectedOrdinal = matched >= 0 ? matched : 0;
+      const selectedOrdinal = preferredOrdinal !== undefined && document.devices[preferredOrdinal] ? preferredOrdinal : matched >= 0 ? matched : 0;
+      const original = deviceConfigData(document.devices[selectedOrdinal]);
+      const effective = normalizeConfigData(overrideConfig ?? original).formatted ?? original;
       autoMatchContextRef.current = slave ? `${document.document_id}:${slaveIdentityKey(slave)}` : "";
-      setEsi(document); setOrdinal(selectedOrdinal); await generate(document, selectedOrdinal);
+      setEsi(document); setOrdinal(selectedOrdinal); setOriginalConfigData(original); setConfigData(effective); await generate(document, selectedOrdinal, effective);
     }
   }, [generate, recentEsi, run, slaveIdentityKey(slave)]);
+  useEffect(() => {
+    if (!initialSelection) return;
+    void loadXml(initialSelection.path, initialSelection.ordinal, initialSelection.configData)
+      .finally(onInitialSelectionConsumed);
+  }, [initialSelection, loadXml, onInitialSelectionConsumed]);
   const selectXml = async () => {
     const path = await pickFile(["xml"]); if (path) await loadXml(path);
   };
@@ -683,7 +718,21 @@ function EepromPage({ slave, status, progress, setProgress, run }: { slave?: Sla
     }).then((value) => { dispose = value; });
     return () => dispose?.();
   }, [loadXml, operationInProgress]);
-  const changeDevice = async (value: number) => { setOrdinal(value); if (esi) await generate(esi, value); };
+  useEffect(() => {
+    if (!esi || !configDataResult.formatted || configDataResult.formatted === generatedConfigRef.current) return;
+    setTarget(undefined);
+    const timer = window.setTimeout(() => void generate(esi, ordinal, configDataResult.formatted!), 250);
+    return () => window.clearTimeout(timer);
+  }, [configData, configDataResult.formatted, esi, generate, ordinal]);
+  const changeDevice = async (value: number) => {
+    setOrdinal(value);
+    if (esi) {
+      const nextConfig = deviceConfigData(esi.devices[value]);
+      setOriginalConfigData(nextConfig);
+      setConfigData(nextConfig);
+      await generate(esi, value, nextConfig);
+    }
+  };
   const operation = async <T,>(fn: () => Promise<T>, success: string): Promise<T | undefined> => {
     if (["eeprom_read", "eeprom_backup", "eeprom_flash", "eeprom_restore"].some((method) => operationStore.active(method))) return undefined;
     setOperationResult(undefined);
@@ -737,13 +786,22 @@ function EepromPage({ slave, status, progress, setProgress, run }: { slave?: Sla
     {!slave ? <EmptyState text="请先选择目标从站" /> : <Stack spacing={1.5}>
       <Box sx={{ display: "grid", gridTemplateColumns: "minmax(0, 1.15fr) minmax(320px, .85fr)", gap: 1.25, alignItems: "start" }}>
         <Card sx={cardSx}><CardContent><Stack direction="row" alignItems="center" justifyContent="space-between"><Box><Typography variant="h6">烧录目标</Typography><Typography color="text.secondary">XML 或 Device 变化时自动生成</Typography></Box><Button disabled={operationInProgress} variant="outlined" startIcon={<FolderOpenRounded />} onClick={selectXml}>选择 XML</Button></Stack><Divider sx={{ my: 2 }} />
-          {esi ? <Stack spacing={1.5}><TextField label="XML 文件" size="small" value={esi.path} InputProps={{ readOnly: true }} /><FormControl disabled={operationInProgress} fullWidth size="small"><InputLabel>Device</InputLabel><Select label="Device" value={ordinal} onChange={(e) => changeDevice(Number(e.target.value))}>{esi.devices.map((device, i) => <MenuItem value={i} key={i}>{device.name} · {hex(device.product_code, 8)}</MenuItem>)}</Select></FormControl>{identityMismatch && <Alert severity="warning">当前 XML/Device 与目标从站不一致：{identityMismatches.join("、")}。身份不匹配仅作警告，不要求额外确认；请自行核对目标是否正确。</Alert>}{generationError ? <Alert severity="error"><Typography fontWeight={700}>目标生成失败</Typography>{generationError}</Alert> : target ? <Alert severity={targetNeedsAttention(target) ? "warning" : "success"}>{targetNeedsAttention(target) ? "目标已生成，但有容量降级或关键类别未写入；请查看 Smart View。" : "目标已生成，容量与完整性由烧录条件继续检查。"}</Alert> : <Alert severity="info">正在生成 Smart View…</Alert>}</Stack> : <Box sx={{ py: 6, textAlign: "center", color: "text.secondary" }}>选择厂商 ESI XML 后自动解析并生成目标</Box>}
+          {esi ? <Stack spacing={1.5}>
+            <TextField label="XML 文件" size="small" value={esi.path} InputProps={{ readOnly: true }} />
+            <FormControl disabled={operationInProgress} fullWidth size="small"><InputLabel>Device</InputLabel><Select label="Device" value={ordinal} onChange={(e) => changeDevice(Number(e.target.value))}>{esi.devices.map((device, i) => <MenuItem value={i} key={i}>{device.name} · {hex(device.product_code, 8)}</MenuItem>)}</Select></FormControl>
+            <Box sx={{ p: 1.4, border: 1, borderColor: "divider", borderRadius: 1.25, bgcolor: "#FAFBFD" }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1} sx={{ mb: 0.8 }}><Box><Typography variant="subtitle2">本次烧录 ConfigData</Typography><Typography variant="caption" color="text.secondary">10 byte；修改只作用于本次内存目标，原 XML 不变</Typography></Box><Button size="small" disabled={operationInProgress || configData === originalConfigData} onClick={() => setConfigData(originalConfigData)}>恢复原值</Button></Stack>
+              <TextField fullWidth size="small" value={configData} disabled={operationInProgress} error={Boolean(configDataResult.error)} helperText={configDataResult.error ?? (configDecoded ? `PDI ${configDecoded.formatted.slice(0, 2)} · ${configDecoded.pdiLabel}` : "输入 10 个十六进制字节")} onChange={(event) => { setConfigData(event.target.value.toUpperCase()); setTarget(undefined); }} onBlur={() => configDataResult.formatted && setConfigData(configDataResult.formatted)} inputProps={{ className: "mono", spellCheck: false }} />
+            </Box>
+            {identityMismatch && <Alert severity="info">当前 XML/Device 与目标从站身份不同：{identityMismatches.join("、")}。该信息仅供核对，不影响烧录。</Alert>}
+            {generationError ? <Alert severity="error"><Typography fontWeight={700}>目标生成失败</Typography>{generationError}</Alert> : target ? <Alert severity={targetNeedsAttention(target) ? "warning" : "success"}>{targetNeedsAttention(target) ? "目标已生成，但有容量降级或关键类别未写入；请查看 Smart View。" : "目标已生成，容量与完整性由烧录条件继续检查。"}</Alert> : <Alert severity="info">正在生成 Smart View…</Alert>}
+          </Stack> : <Box sx={{ py: 6, textAlign: "center", color: "text.secondary" }}>选择厂商 ESI XML 后自动解析并生成目标</Box>}
         </CardContent></Card>
         <Card sx={cardSx}><CardContent><Typography variant="h6">Smart View</Typography><Typography color="text.secondary">随当前 XML 和 Device 实时更新</Typography><Divider sx={{ my: 2 }} />
           {currentDevice && target ? <Stack spacing={1.5}><Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1.5 }}>{[["设备", currentDevice.name], ["厂商", esi?.vendor_name], ["Product Code（产品代码）", hex(currentDevice.product_code, 8)], ["Revision（修订版本）", hex(deviceRevision(currentDevice), 8)], ["目标容量", `${target.size} B`], ["物理容量", capacityError ? "读取失败" : physicalSize === undefined ? "读取中…" : `${physicalSize} B`], ["SHA-256", target.sha256]].map(([label, value]) => <Box key={String(label)}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={String(label).includes("Code") || label === "SHA-256" ? "mono" : ""} noWrap title={String(value)}>{value}</Typography></Box>)}</Box>{capacityError && <Alert severity="error">{capacityError}</Alert>}<Divider /><Box><Typography variant="subtitle2">已转换内容</Typography><Stack direction="row" flexWrap="wrap" gap={0.7} sx={{ mt: 1 }}>{target.supported.map((item) => <Chip size="small" color="success" variant="outlined" label={item} key={item} />)}</Stack></Box>{target.omitted.length > 0 && <Box><Typography variant="subtitle2" color={targetNeedsAttention(target) ? "warning.main" : "text.primary"}>{targetNeedsAttention(target) ? "容量降级或未写入类别" : "转换范围说明"}</Typography>{target.omitted.map((item) => <Typography variant="body2" color={targetNeedsAttention(target) ? "warning.main" : "text.secondary"} key={item}>• {item}</Typography>)}</Box>}</Stack> : <Box sx={{ py: 6, textAlign: "center", color: "text.secondary" }}>尚无可预览的烧录目标</Box>}
         </CardContent></Card>
       </Box>
-      <Card sx={cardSx}><CardContent><Box sx={{ display: "grid", gridTemplateColumns: "minmax(0, 1.15fr) minmax(300px, .85fr)", gap: 2, alignItems: "start" }}><Box><Typography variant="h6">读取与恢复</Typography><Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.25 }}>完整读取只刷新 Smart/Hex View；备份 BIN 会保存可恢复文件。</Typography><Stack direction="row" gap={0.75} flexWrap="wrap"><Tooltip title={status.cycle_running ? "完整读取前必须停止周期通信" : ""}><span><Button size="small" variant="outlined" disabled={status.cycle_running || operationInProgress} onClick={readFull}>完整读取</Button></span></Tooltip><Tooltip title={status.cycle_running ? "备份前必须停止周期通信" : ""}><span><Button size="small" variant="outlined" disabled={status.cycle_running || operationInProgress} startIcon={<SaveAltRounded />} onClick={backup}>备份 BIN</Button></span></Tooltip><Tooltip title={status.cycle_running || slave.state !== 1 ? "恢复前必须停止周期通信并切换到 INIT" : ""}><span><Button size="small" color="warning" variant="outlined" disabled={status.cycle_running || slave.state !== 1 || operationInProgress} onClick={restore}>从 BIN 恢复</Button></span></Tooltip>{backupPath && <Button size="small" onClick={() => revealPath(backupPath)} startIcon={<FolderOpenRounded />}>打开备份位置</Button>}</Stack></Box><Box sx={{ borderLeft: { sm: 1 }, borderColor: "divider", pl: { sm: 2 } }}><Typography variant="h6">烧录条件</Typography><Stack direction="row" gap={0.6} flexWrap="wrap" sx={{ my: 1 }}><Chip color={target ? "success" : "default"} label={target ? "目标已生成" : "缺少目标"} /><Chip color={capacityState === "matched" ? "success" : capacityState === "uncompared" ? "default" : "warning"} label={{ uncompared: "容量未比对", unknown: "容量未知", matched: "容量一致", mismatched: "容量不一致" }[capacityState]} /><Chip color={!status.cycle_running ? "success" : "warning"} label={!status.cycle_running ? "周期已停止" : "周期运行中"} /><Chip color={slave.state === 1 ? "success" : "warning"} label={slave.state === 1 ? "从站 INIT" : `当前 ${stateLabel(slave.state)}`} /></Stack><Tooltip title={blockers.join("；")}><span><Button size="small" variant="contained" color="error" disabled={!canFlash} startIcon={<MemoryRounded />} onClick={flash}>烧录</Button></span></Tooltip>{blockers.length > 0 && <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>{blockers.join("；")}</Typography>}</Box></Box></CardContent></Card>
+      <Card sx={cardSx}><CardContent><Box sx={{ display: "grid", gridTemplateColumns: "minmax(0, 1.15fr) minmax(300px, .85fr)", gap: 2, alignItems: "start" }}><Box><Typography variant="h6">读取与恢复</Typography><Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.25 }}>完整读取只刷新 Smart/Hex View；备份 BIN 会保存可恢复文件。</Typography><Stack direction="row" gap={0.75} flexWrap="wrap"><Tooltip title={status.cycle_running ? "完整读取前必须停止周期通信" : ""}><span><Button size="small" variant="outlined" disabled={status.cycle_running || operationInProgress} onClick={readFull}>完整读取</Button></span></Tooltip><Tooltip title={status.cycle_running ? "备份前必须停止周期通信" : ""}><span><Button size="small" variant="outlined" disabled={status.cycle_running || operationInProgress} startIcon={<SaveAltRounded />} onClick={backup}>备份 BIN</Button></span></Tooltip><Tooltip title={status.cycle_running ? "恢复前必须停止周期通信" : "恢复时自动切换到 INIT"}><span><Button size="small" color="warning" variant="outlined" disabled={status.cycle_running || operationInProgress} onClick={restore}>从 BIN 恢复</Button></span></Tooltip>{backupPath && <Button size="small" onClick={() => revealPath(backupPath)} startIcon={<FolderOpenRounded />}>打开备份位置</Button>}</Stack></Box><Box sx={{ borderLeft: { sm: 1 }, borderColor: "divider", pl: { sm: 2 } }}><Typography variant="h6">烧录</Typography><Typography variant="caption" color="text.secondary">执行时自动将目标从站切换到 INIT，再写入并完整校验。</Typography><Stack direction="row" gap={0.6} flexWrap="wrap" sx={{ my: 1 }}><Chip color={target ? "success" : "default"} label={target ? "目标已生成" : "缺少目标"} /><Chip color={capacityState === "matched" ? "success" : capacityState === "uncompared" ? "default" : "warning"} label={{ uncompared: "容量未比对", unknown: "容量未知", matched: "容量一致", mismatched: "容量不一致" }[capacityState]} /><Chip color={!status.cycle_running ? "success" : "warning"} label={!status.cycle_running ? "周期已停止" : "周期运行中"} /></Stack><Tooltip title={blockers.join("；")}><span><Button size="small" variant="contained" color="error" disabled={!canFlash} startIcon={<MemoryRounded />} onClick={flash}>烧录</Button></span></Tooltip>{blockers.length > 0 && <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>{blockers.join("；")}</Typography>}</Box></Box></CardContent></Card>
       {readResult && <Card sx={cardSx}><CardContent><Typography variant="h6">最近完整读取</Typography><Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 1.25, mt: 1.25 }}>{[["读取时间", new Date(readResult.read_at).toLocaleString()], ["容量", `${readResult.size} B`], ["SII 结构", readResult.sii_valid ? `${readResult.category_count ?? 0} 个 Category` : "无效"], ["差异", readResult.comparison ? `${readResult.comparison.differing_bytes} byte` : "未选择目标"], ["Vendor ID（厂商 ID）", readResult.identity ? hex(readResult.identity.vendor_id, 8) : "—"], ["Product Code（产品代码）", readResult.identity ? hex(readResult.identity.product_code, 8) : "—"], ["Revision（修订版本）", readResult.identity ? hex(readResult.identity.revision, 8) : "—"], ["SHA-256", readResult.sha256]].map(([label, value]) => <Box key={label} minWidth={0}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={label === "SHA-256" || label.includes("Code") ? "mono" : ""} noWrap title={value}>{value}</Typography></Box>)}</Box>{!readResult.sii_valid && <Alert severity="warning" sx={{ mt: 1.25 }}>原始 BIN 已完整读取，但 SII 解析失败：{readResult.sii_error}</Alert>}<Accordion disableGutters sx={{ mt: 1.25 }}><AccordionSummary expandIcon={<ExpandMoreRounded />}><Typography fontWeight={700}>Hex View（只读）</Typography></AccordionSummary><AccordionDetails><Box component="pre" className="mono data-surface" sx={{ m: 0, p: 1.25, maxHeight: 320, overflow: "auto", fontSize: 12 }}>{formatHexView(readResult.data)}</Box></AccordionDetails></Accordion></CardContent></Card>}
       {operationResult && <Card sx={cardSx}><CardContent><Alert severity={operationResult.severity}><Typography fontWeight={700}>{operationResult.title}</Typography>{operationResult.error ?? operationResult.payload?.result.image_verification}</Alert>{operationResult.payload && <Accordion disableGutters sx={{ mt: 1.2 }}><AccordionSummary expandIcon={<ExpandMoreRounded />}><Typography fontWeight={700}>技术详情</Typography></AccordionSummary><AccordionDetails><Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1 }}>{[["写入 Word", operationResult.payload.result.words_written], ["完整回读", `${operationResult.payload.result.bytes_read_back} B`], ["差异字节", operationResult.payload.result.comparison.differing_bytes], ["目标 SHA-256", operationResult.payload.result.comparison.target_sha256], ["回读 SHA-256", operationResult.payload.result.comparison.readback_sha256], ["SII 结构", operationResult.payload.result.sii_valid ? "通过" : "失败"], ["XML 语义", operationResult.payload.result.semantic_valid ? "通过" : "失败"], ["RES 序列", operationResult.payload.result.reset_sequence?.every(Boolean) ? "三帧成功" : "未完成"], ["重新发现", operationResult.payload.result.rediscovered === undefined ? "未执行" : operationResult.payload.result.rediscovered ? "成功" : "失败"], ["重新加载复核", operationResult.payload.result.reload_verified === undefined ? "未执行" : operationResult.payload.result.reload_verified ? "成功" : "失败"]].map(([label, value]) => <Box key={String(label)}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography className={String(label).includes("SHA") ? "mono" : ""} noWrap title={String(value)}>{String(value)}</Typography></Box>)}</Box></AccordionDetails></Accordion>}</CardContent></Card>}
     </Stack>}</>;
@@ -764,11 +822,15 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState(0);
   const [alLanguage, setAlLanguage] = useState<AlStatusLanguage>(() => window.localStorage.getItem(AL_LANGUAGE_KEY) === "en" ? "en" : "zh");
   const [slaveContextMenu, setSlaveContextMenu] = useState<SlaveContextMenu>();
+  const [quickFlashOpen, setQuickFlashOpen] = useState(false);
+  const [eepromDetailSelection, setEepromDetailSelection] = useState<EepromDetailSelection>();
+  const [eepromReadCache, setEepromReadCache] = useState<Record<string, EepromReadResult>>({});
   const [progress, setProgress] = useState<ProgressState>();
   const [registerProfileOverrides, setRegisterProfileOverrides] = useState<Record<string, string>>({});
   const appliedClockRef = useRef<{ hostGeneration: number; sessionId: number } | undefined>(undefined);
   const slave = status.slaves.find((item) => item.position === selectedPosition);
   const selectedSlaveKey = slaveIdentityKey(slave);
+  const eepromReadCacheKey = `${status.host_generation}:${status.session_id}:${selectedSlaveKey}`;
   const registerProfile = slave ? registerProfileOverrides[selectedSlaveKey] ?? defaultRegisterProfile(slave.chip_model) : "ET1100";
   const operations = useSyncExternalStore(operationStore.subscribe, operationStore.snapshot);
   const busy = useMemo(() => [...operations.values()].some((operation) =>
@@ -793,6 +855,7 @@ export default function App() {
     if (sessionChanged) {
       setSnapshot(undefined);
       setRegisterProfileOverrides({});
+      setEepromReadCache({});
     }
   }), []);
 
@@ -908,13 +971,13 @@ export default function App() {
         const next = event.data as OperationProgress;
         const fraction = next.total > 0 ? Math.min(1, next.completed / next.total) : 0;
         const ranges: Record<string, [number, number]> = {
-          "read-current": [0, 20], "write-verify": [20, 65], "stability-wait": [65, 75],
+          "prepare-init": [0, 5], "read-current": [5, 20], "write-verify": [20, 65], "stability-wait": [65, 75],
           "full-verify": [75, 95], reset: [95, 97], "reload-verify": [97, 100],
         };
         const range = ranges[next.stage];
         const calculated = Math.round(range ? range[0] + (range[1] - range[0]) * fraction : fraction * 100);
         const labels: Record<string, string> = {
-          read: "完整读取", "backup-read": "读取并保存 BIN", "read-current": "读取当前 EEPROM",
+          read: "完整读取", "backup-read": "读取并保存 BIN", "prepare-init": "自动切换 INIT", "read-current": "读取当前 EEPROM",
           "write-verify": "写入并校验", "stability-wait": "等待 EEPROM 稳定",
           "full-verify": "完整回读校验", reset: "复位并重新发现", "reload-verify": "复位后重新加载复核",
         };
@@ -1012,19 +1075,21 @@ export default function App() {
     operationStore.nextPage();
     setPage(nextPage);
   }, [page]);
+  const setSelectedEepromReadResult = useCallback((value?: EepromReadResult) => {
+    if (value) setEepromReadCache((current) => ({ ...current, [eepromReadCacheKey]: value }));
+  }, [eepromReadCacheKey]);
+  const consumeEepromDetailSelection = useCallback(() => setEepromDetailSelection(undefined), []);
 
   const openSlaveContextMenu = (event: ReactMouseEvent, position: number) => {
     event.preventDefault();
-    if (page === "overview") {
-      setSelectedPosition(position);
-      setSlaveContextMenu({ mouseX: event.clientX + 2, mouseY: event.clientY - 6, position });
-    }
+    setSelectedPosition(position);
+    setSlaveContextMenu({ mouseX: event.clientX + 2, mouseY: event.clientY - 6, position });
   };
 
   const openSlaveEeprom = () => {
     if (slaveContextMenu) setSelectedPosition(slaveContextMenu.position);
     setSlaveContextMenu(undefined);
-    navigate("eeprom");
+    setQuickFlashOpen(true);
   };
 
   const visit = (url: string) => {
@@ -1038,8 +1103,8 @@ export default function App() {
     const props = { slave, run };
     if (page === "overview") return <OverviewPage {...props} status={status} busy={busy} slaves={status.slaves} refresh={refreshStates} registerProfile={registerProfile} alLanguage={alLanguage} onRegisterProfileChange={(profile) => slave && setRegisterProfileOverrides((current) => ({ ...current, [selectedSlaveKey]: profile }))} />;
     if (page === "registers") return <RegistersPage {...props} registerProfile={registerProfile} />;
-    return <EepromPage {...props} status={status} progress={progress} setProgress={setProgress} />;
-  }, [page, registerProfile, selectedSlaveKey, selectedPosition, slave, status, snapshot, progress, refreshStates, run, busy, alLanguage]);
+    return <EepromPage {...props} status={status} progress={progress} setProgress={setProgress} readResult={eepromReadCache[eepromReadCacheKey]} setReadResult={setSelectedEepromReadResult} initialSelection={eepromDetailSelection} onInitialSelectionConsumed={consumeEepromDetailSelection} />;
+  }, [page, registerProfile, selectedSlaveKey, selectedPosition, slave, status, snapshot, progress, refreshStates, run, busy, alLanguage, eepromReadCache, eepromReadCacheKey, eepromDetailSelection, setSelectedEepromReadResult, consumeEepromDetailSelection]);
 
   return <Box sx={{ display: "flex", height: "100vh", bgcolor: "background.default" }}>
     <Drawer variant="permanent" PaperProps={{ sx: { width: 148, borderRight: 1, borderColor: "divider", bgcolor: "#FBFCFE", overflow: "hidden" } }}>
@@ -1086,9 +1151,10 @@ export default function App() {
     >
       <MenuItem onClick={openSlaveEeprom}>
         <ListItemIcon><MemoryRounded fontSize="small" color="warning" /></ListItemIcon>
-        <ListItemText primary="烧录 EEPROM" secondary={slaveContextMenu ? `从站 ${slaveContextMenu.position} · 打开烧录页面` : ""} />
+        <ListItemText primary="烧录 EEPROM" />
       </MenuItem>
     </Menu>
+    <QuickEepromFlashDialog open={quickFlashOpen} slave={slave} status={status} progress={progress} setProgress={setProgress} onClose={() => setQuickFlashOpen(false)} onOpenDetails={(selection) => { setQuickFlashOpen(false); setEepromDetailSelection(selection); navigate("eeprom"); }} />
     <Dialog open={settings} onClose={() => setSettings(false)} fullWidth maxWidth="sm">
       <DialogTitle sx={{ pb: 1 }}>设置</DialogTitle>
       <Tabs value={settingsTab} onChange={(_, value) => setSettingsTab(value)} sx={{ px: 2.5, minHeight: 42 }}>

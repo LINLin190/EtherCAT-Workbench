@@ -115,6 +115,16 @@ class EepromService:
             raise RuntimeError("EEPROM size word could not be read")
         return self.capacity_from_size_word(int.from_bytes(size_and_version[:2], "little"))
 
+    def read_configuration_header(self, position: int) -> bytes:
+        """Read the eight-word ESC configuration area without scanning the full EEPROM."""
+        result = bytearray()
+        for word_address in range(0, 8, 2):
+            chunk = self.backend.eeprom_read(position, word_address)
+            if len(chunk) != 4:
+                raise RuntimeError(f"EEPROM returned {len(chunk)} bytes; expected four")
+            result.extend(chunk)
+        return bytes(result)
+
     def read_full(
         self,
         position: int,

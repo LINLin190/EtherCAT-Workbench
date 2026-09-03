@@ -615,7 +615,7 @@ def test_expired_hardware_request_never_reaches_worker() -> None:
         runtime.shutdown()
 
 
-def test_lyw_esi_full_flash_flow(tmp_path, workspace) -> None:
+def test_esi_full_flash_flow_auto_init_and_config_override(tmp_path, workspace) -> None:
     writer = RecordingWriter()
     audit_path = tmp_path / "audit.jsonl"
     runtime = BridgeRuntime(
@@ -627,24 +627,41 @@ def test_lyw_esi_full_flash_flow(tmp_path, workspace) -> None:
     )  # type: ignore[arg-type]
     try:
         runtime.dispatch("auto_scan", {"preferred_adapter": "demo0"})
-        runtime.dispatch("request_state", {"position": 1, "state": 1})
-        assert runtime.dispatch("status", {})["slaves"][0].state.value == 1
+        assert runtime.dispatch("status", {})["slaves"][0].state is not EtherCatState.INIT
 
+        source = workspace / "ESI示例" / "SlaveCTT_900e80.xml"
+        source_before = source.read_bytes()
         loaded = runtime.dispatch(
-            "esi_load", {"path": str(workspace / "LYW_CanMotor_SIP-V2.2" / "XHD_CAN_Motor_18x8.xml")}
+            "esi_load", {"path": str(source)}
         )
-        target = runtime.dispatch("sii_generate", {"document_id": loaded["document_id"], "ordinal": 0})
+        original_config = loaded["devices"][0].config_data
+        override_config = "8D 0E 03 44 0A 00 00 00 00 00"
+        target = runtime.dispatch(
+            "sii_generate",
+            {"document_id": loaded["document_id"], "ordinal": 0, "config_data": override_config},
+        )
         assert target["size"] == 2048
+        assert target["original_config_data"] == original_config
+        assert target["effective_config_data"] == bytes.fromhex(override_config)
+        assert target["device"].config_data == bytes.fromhex(override_config)
+        assert source.read_bytes() == source_before
         assert target["layout"][0]["name"] == "Fixed SII area"
         assert target["layout"][-1]["kind"] == 0xFFFF
-        assert any("PDO categories omitted" in item for item in target["omitted"])
         assert runtime.dispatch("eeprom_capacity", {"position": 1}) == {"size": 2048}
+        header = runtime.dispatch("eeprom_header", {"position": 1})
+        assert len(header["header"]) == 16
+        assert len(header["config_data"]) == 10
+        assert header["size"] == 2048
 
         result = runtime.dispatch(
             "eeprom_flash",
             {"position": 1, "target_id": target["target_id"], "auto_reset": True},
         )
         assert result["success"] is True
+        assert any(
+            event == "progress" and payload.stage == "prepare-init"
+            for event, payload in writer.events
+        )
         flash = result["result"]
         assert flash.comparison.equal and flash.sii_valid and flash.semantic_valid
         assert flash.reset_sequence == (True, True, True)
@@ -653,10 +670,23 @@ def test_lyw_esi_full_flash_flow(tmp_path, workspace) -> None:
         read = runtime.dispatch("eeprom_read", {"position": 1, "target_id": target["target_id"]})
         assert read["sii_valid"] is True
         assert read["comparison"].equal is True
-        assert read["identity"]["vendor_id"] == 0x153
+        assert read["identity"]["vendor_id"] == loaded["vendor_id"]
         audit = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
         assert audit[-1]["action"] == "eeprom_flash"
         assert audit[-1]["outcome"] == "succeeded"
-        assert audit[-1]["details"]["vendor_id"] == 0x153
+        assert audit[-1]["details"]["vendor_id"] == loaded["vendor_id"]
+        assert audit[-1]["details"]["auto_init"] is True
+    finally:
+        runtime.shutdown()
+
+
+def test_esi_library_list_returns_all_devices(workspace) -> None:
+    runtime = BridgeRuntime(RecordingWriter(), BackendMode.DEMO)  # type: ignore[arg-type]
+    try:
+        result = runtime.dispatch("esi_library_list", {"directory": str(workspace / "xml列表")})
+        assert result["directory"] == str((workspace / "xml列表").resolve())
+        assert result["entries"]
+        assert all(entry["path"].lower().endswith(".xml") for entry in result["entries"])
+        assert all(len(entry["config_data"]) >= 10 for entry in result["entries"])
     finally:
         runtime.shutdown()

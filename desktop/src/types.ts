@@ -143,6 +143,7 @@ export interface EsiDevice {
   group_type?: string;
   eeprom_byte_size?: number;
   byte_size?: number;
+  config_data?: string;
   [key: string]: unknown;
 }
 

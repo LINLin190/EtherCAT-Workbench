@@ -30,11 +30,22 @@ from .models import AccessSemantics, BackendMode, EtherCatState, OperationProgre
 from .services.eeprom_service import EepromService, compare_images
 from .services.register_service import RegisterService, RegisterWritePlan, ResetService
 from .sii.generator import SiiGenerationReport, SiiGenerator
-from .sii.parser import SiiParser
+from .sii.parser import SiiParser, crc8
 from .worker import EtherCatWorker
 from .worker.ethercat_worker import Priority
 
 AUTO_SCAN_ADAPTER_TIMEOUT_S = 4.0
+
+
+def _default_esi_library_path() -> Path | None:
+    configured = os.environ.get("ETHERCAT_WORKBENCH_ESI_LIBRARY")
+    if configured:
+        return Path(configured).resolve()
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "xml列表"
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def _json_value(value: Any) -> Any:
@@ -490,6 +501,26 @@ class BridgeRuntime:
         if not 1 <= position <= len(self.slaves):
             raise ValueError(f"Slave {position} is not available")
         return self.slaves[position - 1]
+
+    def _ensure_slave_init(self, position: int, operation: str) -> tuple[Any, bool]:
+        slave = self._slave(position)
+        if slave.state is EtherCatState.INIT:
+            return slave, False
+        self._progress(
+            OperationProgress(operation, "prepare-init", 0, 1, "正在将目标从站切换到 INIT", True)
+        )
+        slaves = list(self._submit("request_state", position, EtherCatState.INIT, 2_000_000))
+        current = next((item for item in slaves if item.position == position), None)
+        if current is None or current.state is not EtherCatState.INIT:
+            actual = current.state.name if current is not None else "未发现"
+            raise RuntimeError(f"从站 {position} 未能进入 INIT，当前状态：{actual}")
+        if self.master_state.states_updated(slaves):
+            self.write_plans.clear()
+        self._publish_snapshot()
+        self._progress(
+            OperationProgress(operation, "prepare-init", 1, 1, "目标从站已进入 INIT", True)
+        )
+        return current, True
 
     def _slave_signature(self, position: int) -> tuple[int, int, int, int, int | None]:
         slave = self._slave(position)
@@ -990,6 +1021,20 @@ class BridgeRuntime:
         if method == "eeprom_capacity":
             size = self._submit(lambda backend: EepromService(backend).read_capacity(int(params["position"])))
             return {"size": size}
+        if method == "eeprom_header":
+            position = int(params["position"])
+            header, size = self._submit(
+                lambda backend: (
+                    EepromService(backend).read_configuration_header(position),
+                    EepromService(backend).read_capacity(position),
+                )
+            )
+            return {
+                "header": header,
+                "config_data": header[:10],
+                "crc_valid": crc8(header) == 0,
+                "size": size,
+            }
         if method == "eeprom_backup":
             if self.cycle_running:
                 raise RuntimeError("备份 EEPROM 前必须先安全停止周期通信")
@@ -1005,6 +1050,35 @@ class BridgeRuntime:
                 ),
                 timeout=300,
             )
+        if method == "esi_library_list":
+            library = Path(params["directory"]).resolve() if params.get("directory") else _default_esi_library_path()
+            if library is None or not library.is_dir():
+                return {"directory": str(library or ""), "entries": [], "errors": []}
+            entries: list[dict[str, Any]] = []
+            errors: list[dict[str, str]] = []
+            for source in sorted(library.glob("*.xml"), key=lambda item: item.name.casefold()):
+                try:
+                    document = EsiParser().parse(source)
+                except BaseException as exc:
+                    errors.append({"path": str(source), "error": str(exc)})
+                    continue
+                for device in document.devices:
+                    entries.append(
+                        {
+                            "path": str(document.path),
+                            "sha256": document.sha256,
+                            "vendor_id": document.vendor_id,
+                            "vendor_name": document.vendor_name,
+                            "ordinal": device.ordinal,
+                            "device_name": device.name,
+                            "type_name": device.type_name,
+                            "product_code": device.product_code,
+                            "revision": device.revision,
+                            "byte_size": device.byte_size,
+                            "config_data": device.config_data,
+                        }
+                    )
+            return {"directory": str(library), "entries": entries, "errors": errors}
         if method == "esi_load":
             document = EsiParser().parse(Path(params["path"]))
             document_id = uuid.uuid4().hex
@@ -1021,6 +1095,15 @@ class BridgeRuntime:
             document = self.documents[str(params["document_id"])]
             ordinal = int(params["ordinal"])
             device = document.devices[ordinal]
+            original_config_data = device.config_data
+            if params.get("config_data") is not None:
+                try:
+                    config_data = bytes.fromhex(str(params["config_data"]))
+                except ValueError as exc:
+                    raise ValueError("ConfigData 必须是十六进制字节") from exc
+                if len(config_data) != 10:
+                    raise ValueError("ConfigData 必须正好包含 10 个字节")
+                device = dataclasses.replace(device, config_data=config_data)
             report: SiiGenerationReport = SiiGenerator().generate(device)
             target_id = uuid.uuid4().hex
             self.targets[target_id] = (report.image, device)
@@ -1071,18 +1154,19 @@ class BridgeRuntime:
                 "omitted": report.omitted,
                 "layout": layout,
                 "device": device,
+                "original_config_data": original_config_data,
+                "effective_config_data": device.config_data,
             }
         if method == "eeprom_flash":
             position = int(params["position"])
             slave = self._slave(position)
             if self.cycle_running:
                 raise RuntimeError("必须先安全停止周期通信")
-            if slave.state is not EtherCatState.INIT:
-                raise RuntimeError("目标从站必须先切换到 INIT")
             target, device = self.targets[str(params["target_id"])]
             self.cancel.clear()
             details = {
                 "position": position,
+                "initial_state": slave.state.name,
                 "target_sha256": hashlib.sha256(target).hexdigest(),
                 "size": len(target),
                 "vendor_id": device.vendor_id,
@@ -1090,6 +1174,8 @@ class BridgeRuntime:
                 "revision": device.revision,
             }
             try:
+                _, state_changed = self._ensure_slave_init(position, "eeprom-flash")
+                details["auto_init"] = state_changed
                 result = self._submit(
                     lambda backend: EepromService(
                         backend,
@@ -1138,12 +1224,14 @@ class BridgeRuntime:
         if method == "eeprom_restore":
             position = int(params["position"])
             slave = self._slave(position)
-            if self.cycle_running or slave.state is not EtherCatState.INIT:
-                raise RuntimeError("必须停止周期通信并将目标从站切换到 INIT")
+            if self.cycle_running:
+                raise RuntimeError("必须先安全停止周期通信")
             self.cancel.clear()
             path = Path(params["path"])
-            details = {"position": position, "path": str(path)}
+            details = {"position": position, "path": str(path), "initial_state": slave.state.name}
             try:
+                _, state_changed = self._ensure_slave_init(position, "eeprom-restore")
+                details["auto_init"] = state_changed
                 result = self._submit(
                     lambda backend: EepromService(
                         backend,
