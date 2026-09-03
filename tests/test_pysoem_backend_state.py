@@ -1,6 +1,6 @@
 import pytest
 
-from ethercat_debug_tool.backends.pysoem_backend import PysoemBackend
+from ethercat_debug_tool.backends.pysoem_backend import DISCOVERY_FPRD_TIMEOUT_US, PysoemBackend
 from ethercat_debug_tool.models import EtherCatState, SlaveIdentity, SlaveInfo
 
 
@@ -100,6 +100,35 @@ def test_scan_serial_uses_sii_without_optional_sdo_probe() -> None:
             pytest.fail("scan must not wait for optional CoE identity object")
 
     assert PysoemBackend()._serial(IdentitySlave()) == 0x12345678
+
+
+def test_discovery_register_probes_use_a_short_bounded_timeout(monkeypatch) -> None:
+    class ProbeSlave:
+        name = "Motor"
+        man = 1
+        id = 2
+        rev = 3
+        state = int(EtherCatState.PRE_OP)
+        al_status = 0
+        input = b""
+        output = b""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int, int]] = []
+
+        def _fprd(self, address: int, size: int, timeout_us: int) -> bytes:
+            self.calls.append((address, size, timeout_us))
+            raise RuntimeError("optional register unavailable")
+
+    slave = ProbeSlave()
+    backend = PysoemBackend()
+    monkeypatch.setattr(backend, "_serial", lambda _: 0)
+
+    info = backend._info(1, slave)
+
+    assert info.name == "Motor"
+    assert [call[2] for call in slave.calls] == [DISCOVERY_FPRD_TIMEOUT_US] * 3
+    assert DISCOVERY_FPRD_TIMEOUT_US <= 2_000
 
 
 def test_disconnect_clears_internal_state_even_when_master_close_fails() -> None:

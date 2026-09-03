@@ -18,6 +18,12 @@ from ..models import (
 )
 from .base import CommunicationError, EnvironmentError
 
+# Discovery must remain bounded when a slave does not implement an optional
+# ESC register.  EtherCAT round trips are normally below 1 ms; 2 ms leaves
+# room for a loaded Windows host without allowing one probe to consume the
+# whole scan deadline.
+DISCOVERY_FPRD_TIMEOUT_US = 2_000
+
 
 def _decode_adapter_description(value: object) -> str:
     if isinstance(value, bytes):
@@ -156,18 +162,20 @@ class PysoemBackend:
         configured_address = None
         chip_model, family = "Generic ESC", "GENERIC"
         try:
-            configured_address = int.from_bytes(slave._fprd(0x0010, 2, 4000), "little")
+            configured_address = int.from_bytes(
+                slave._fprd(0x0010, 2, DISCOVERY_FPRD_TIMEOUT_US), "little"
+            )
         except Exception:
             pass
         chip_raw = b""
         try:
-            chip_raw = slave._fprd(0x0E00, 4, 4000)
+            chip_raw = slave._fprd(0x0E00, 4, DISCOVERY_FPRD_TIMEOUT_US)
         except Exception:
             # Some ESCs reject reads in the 0x0E00 area; the capability
             # signature below still identifies original vendor chips.
             pass
         try:
-            capabilities = slave._fprd(0x0004, 3, 4000)
+            capabilities = slave._fprd(0x0004, 3, DISCOVERY_FPRD_TIMEOUT_US)
         except Exception:
             capabilities = None
         if capabilities is not None or chip_raw:
