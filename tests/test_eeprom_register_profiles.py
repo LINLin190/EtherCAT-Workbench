@@ -17,6 +17,12 @@ def test_compare_reports_first_byte_and_hash() -> None:
     assert result.target_sha256 != result.readback_sha256
 
 
+def test_eeprom_rediscovery_defaults_are_bounded_for_quick_recovery() -> None:
+    service = EepromService(MockBackend())
+    assert service.rediscovery_timeout_s == 3.0
+    assert service.rediscovery_poll_s == 0.1
+
+
 def test_mock_flash_does_not_create_backup_and_fully_verifies(sample_esi) -> None:
     backend = MockBackend()
     backend.connect("demo0")

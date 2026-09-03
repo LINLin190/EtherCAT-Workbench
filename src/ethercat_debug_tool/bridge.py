@@ -254,8 +254,8 @@ class BridgeRuntime:
         *,
         audit_path: Path | None = None,
         stability_wait_s: float = 1.0,
-        rediscovery_timeout_s: float = 5.0,
-        rediscovery_poll_s: float = 0.25,
+        rediscovery_timeout_s: float = 3.0,
+        rediscovery_poll_s: float = 0.1,
     ) -> None:
         self.writer = writer
         self.registry = load_command_registry()

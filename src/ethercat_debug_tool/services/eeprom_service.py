@@ -71,8 +71,8 @@ class EepromService:
         backend: EtherCatBackend,
         *,
         stability_wait_s: float = 1.0,
-        rediscovery_timeout_s: float = 5.0,
-        rediscovery_poll_s: float = 0.25,
+        rediscovery_timeout_s: float = 3.0,
+        rediscovery_poll_s: float = 0.1,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
