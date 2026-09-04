@@ -60,7 +60,7 @@ EtherCAT Workbench 是一款基于 **Tauri 2、Rust、React、TypeScript、Mater
 
 ### 安装与启动
 
-当前发布版本使用 Tauri 2 Windows bundle 流程，仅生成简体中文界面的 NSIS（`.exe`）安装包，不再生成或发布 MSI；Npcap 不随安装包捆绑，Python 运行环境与 `pysoem==1.1.13` 仍需按运行环境要求准备。
+当前发布版本使用 Tauri 2 Windows bundle 流程，仅生成简体中文界面的 NSIS（`.exe`）安装包，不再生成或发布 MSI。安装包内含独立的 Python Bridge、Python 运行时和 `pysoem==1.1.13`，目标电脑无需另装 Python。Npcap 不随安装包捆绑，Real 模式仍要求单独安装 Npcap 并启用 WinPcap API-compatible Mode。
 
 在 PowerShell 中执行：
 
@@ -222,13 +222,16 @@ flowchart LR
 
 ### 构建 Windows 应用
 
-维护者可在 `desktop` 目录执行前端构建，并由 Tauri 工具链生成简体中文 NSIS Windows 安装器：
+维护者可在 `desktop` 目录分别检查前端和生成自包含的 Python Bridge：
 
 ```powershell
 Set-Location desktop
 pnpm install
 pnpm build
+pnpm build:bridge
 ```
+
+确认开发版和冻结 Bridge 均通过验证后，才执行 `pnpm tauri:build` 生成简体中文 NSIS Windows 安装器。Tauri 会把 `desktop/src-tauri/resources/bridge` 中的完整 `onedir` 目录复制到安装资源目录，Release 主程序不会调用系统 Python 或开发机源码路径。
 
 正式打包前仍需在 Windows x64 上验证 WebView2、Python Bridge、pySOEM 和 Npcap 的部署边界；Npcap 不会被打入应用包。
 

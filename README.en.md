@@ -39,7 +39,7 @@ The application reports actionable errors when Npcap/wpcap is missing, permissio
 
 ### Install and run
 
-Release builds use the Tauri 2 Windows bundle flow and produce only an NSIS (`.exe`) installer with a Simplified Chinese installer and uninstaller UI; MSI packages are no longer built or published. Npcap is not bundled, and the Python runtime with `pysoem==1.1.13` must be prepared separately. Run in PowerShell:
+Release builds use the Tauri 2 Windows bundle flow and produce only an NSIS (`.exe`) installer with a Simplified Chinese installer and uninstaller UI; MSI packages are no longer built or published. The installer includes a standalone Python bridge, the Python runtime, and `pysoem==1.1.13`, so target computers do not need a separate Python installation. Npcap is not bundled; Real mode still requires a separate Npcap installation with WinPcap API-compatible Mode enabled. Run in PowerShell:
 
 ```powershell
 git clone https://github.com/LINLin190/EtherCAT-Workbench.git
@@ -121,13 +121,16 @@ Supported: ConfigData/CRC-8, Identity, standard Mailbox, Strings, General, FMMU,
 
 ### Build the Windows application
 
-Maintainers can build the Simplified Chinese NSIS Windows installer locally from the `desktop` directory:
+Maintainers can validate the frontend and create the self-contained Python bridge separately from the `desktop` directory:
 
 ```powershell
 Set-Location desktop
 pnpm install
 pnpm build
+pnpm build:bridge
 ```
+
+Run `pnpm tauri:build` only after the development application and frozen bridge have been verified. Tauri copies the complete `onedir` output under `desktop/src-tauri/resources/bridge` into the installed resource directory; the Release host does not invoke system Python or a build-machine source path.
 
 Before distributing an application bundle, verify WebView2, the Python bridge, pySOEM, and Npcap deployment boundaries on Windows x64. Npcap is never bundled.
 

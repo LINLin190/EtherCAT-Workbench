@@ -12,12 +12,14 @@ Tauri 2 host (Rust)
         │ framed JSON over a per-process Windows Named Pipe
         ▼
 Python bridge process
+  Debug: source Python / Release: bundled PyInstaller onedir
         │ exclusive requests/events
         ▼
 EtherCatWorker → services → Real/Mock backend → pySOEM
 ```
 
 - The webview never imports or calls pySOEM.
+- Release builds resolve the frozen bridge from Tauri's resource directory. They never depend on a target computer's `PATH`, Python installation, or the build machine's source tree.
 - The Rust host owns one replaceable Python hardware-process generation. A hard command deadline terminates that generation before a clean, disconnected replacement is admitted.
 - On Windows the Python process belongs to a kill-on-close Job Object, so a host crash cannot leave an orphaned Master owner.
 - stdout and stderr are diagnostic logs only and cannot corrupt IPC framing.

@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "EtherCAT Workbench",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "identifier": "com.ethercat.workbench",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:bundle",
     "frontendDist": "../dist"
   },
   "app": {
@@ -28,6 +28,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": {
+      "resources/bridge/": "bridge/"
+    },
     "icon": [
       "icons/icon.ico",
       "icons/icon.png"

@@ -8,6 +8,8 @@ build/
 dist/
 node_modules/
 desktop/src-tauri/target/
+desktop/src-tauri/resources/bridge/*
+!desktop/src-tauri/resources/bridge/.gitkeep
 *.log
 /npcap-*.exe
 

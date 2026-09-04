@@ -232,12 +232,119 @@ fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>, String> {
     Ok(Some(SingleInstanceGuard(handle as usize)))
 }
 
+#[cfg(windows)]
+fn bring_existing_instance_to_front() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let title: Vec<u16> = "EtherCAT Workbench"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if window.is_null() {
+        return false;
+    }
+    if unsafe { IsIconic(window) } != 0 {
+        unsafe { ShowWindow(window, SW_RESTORE) };
+    }
+    unsafe { SetForegroundWindow(window) };
+    true
+}
+
+#[cfg(not(windows))]
+fn bring_existing_instance_to_front() -> bool {
+    false
+}
+
 #[cfg(not(windows))]
 struct SingleInstanceGuard;
 
 #[cfg(not(windows))]
 fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>, String> {
     Ok(Some(SingleInstanceGuard))
+}
+
+fn acquire_single_instance_or_activate() -> Result<Option<SingleInstanceGuard>, String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match acquire_single_instance()? {
+            Some(guard) => return Ok(Some(guard)),
+            None if bring_existing_instance_to_front() => return Ok(None),
+            None if Instant::now() >= deadline => {
+                return Err("旧实例仍在退出且未能释放单实例锁，请稍后重试".into())
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn show_startup_error(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let title: Vec<u16> = "EtherCAT Workbench"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let message: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+
+#[cfg(not(windows))]
+fn show_startup_error(message: &str) {
+    eprintln!("{message}");
+}
+
+fn bridge_process_command(_app: &tauri::AppHandle) -> Result<Command, String> {
+    if let Some(executable) = std::env::var_os("ETHERCAT_WORKBENCH_BRIDGE_EXECUTABLE") {
+        let executable = PathBuf::from(executable);
+        if !executable.is_file() {
+            return Err(format!("指定的通信核心不存在：{}", executable.display()));
+        }
+        return Ok(Command::new(executable));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let python = std::env::var("ETHERCAT_WORKBENCH_PYTHON").unwrap_or_else(|_| "python".into());
+        let mut command = Command::new(python);
+        let mut paths = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src")];
+        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        let python_path = std::env::join_paths(paths).map_err(|error| error.to_string())?;
+        command
+            .env("PYTHONPATH", python_path)
+            .args(["-u", "-m", "ethercat_debug_tool.bridge"]);
+        return Ok(command);
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let executable = _app
+            .path()
+            .resolve(
+                "bridge/ethercat-workbench-bridge.exe",
+                tauri::path::BaseDirectory::Resource,
+            )
+            .map_err(|error| format!("无法定位随包通信核心：{error}"))?;
+        if !executable.is_file() {
+            return Err(format!(
+                "安装不完整：缺少通信核心 {}。请重新安装完整安装包",
+                executable.display()
+            ));
+        }
+        Ok(Command::new(executable))
+    }
 }
 
 fn terminate_and_reap(child: &Arc<Mutex<Child>>) {
@@ -575,14 +682,7 @@ impl Bridge {
                 r"\\.\pipe\ethercat-workbench-response-{}-{nonce}",
                 std::process::id()
             );
-            let python =
-                std::env::var("ETHERCAT_WORKBENCH_PYTHON").unwrap_or_else(|_| "python".into());
-            let mut command = Command::new(python);
-            let mut paths = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src")];
-            if let Some(existing) = std::env::var_os("PYTHONPATH") {
-                paths.extend(std::env::split_paths(&existing));
-            }
-            let python_path = std::env::join_paths(paths).map_err(|e| e.to_string())?;
+            let mut command = bridge_process_command(&app)?;
             let request_handle = create_pipe(&request_pipe_name, PipeDirection::HostWrites)?;
             let response_handle = match create_pipe(&response_pipe_name, PipeDirection::HostReads) {
                 Ok(handle) => handle,
@@ -592,12 +692,8 @@ impl Bridge {
                 }
             };
             command
-                .env("PYTHONPATH", python_path)
                 .env("ETHERCAT_WORKBENCH_REQUEST_PIPE", &request_pipe_name)
                 .env("ETHERCAT_WORKBENCH_RESPONSE_PIPE", &response_pipe_name)
-                .args(["-u", "-m", "ethercat_debug_tool.bridge"])
-                .arg("--workbench-host-root")
-                .arg(env!("CARGO_MANIFEST_DIR"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -634,7 +730,7 @@ impl Bridge {
                 }
                 return Err("无法读取桥接 stdout 日志".into());
             };
-            let Some(stderr) = child.stderr.take() else {
+            let Some(mut stderr) = child.stderr.take() else {
                 let _ = child.kill();
                 let _ = child.wait();
                 unsafe {
@@ -656,18 +752,52 @@ impl Bridge {
             }
             drop(connect_tx);
             let connect_deadline = Instant::now() + Duration::from_secs(10);
-            let connected = (0..2).all(|_| {
-                connect_rx.recv_timeout(connect_deadline.saturating_duration_since(Instant::now()))
-                    == Ok(true)
-            });
-            if !connected {
-                let _ = child.kill();
+            let mut connected_count = 0;
+            let mut connect_error = None;
+            while connected_count < 2 && Instant::now() < connect_deadline {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let mut detail = String::new();
+                        let _ = stderr.read_to_string(&mut detail);
+                        let detail = detail.trim();
+                        connect_error = Some(if detail.is_empty() {
+                            format!("通信核心在连接 Named Pipe 前已退出（{status}）")
+                        } else {
+                            format!("通信核心在连接 Named Pipe 前已退出（{status}）：{detail}")
+                        });
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        connect_error = Some(format!("无法检查通信核心启动状态：{error}"));
+                        break;
+                    }
+                }
+                let remaining = connect_deadline.saturating_duration_since(Instant::now());
+                match connect_rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                    Ok(true) => connected_count += 1,
+                    Ok(false) => {
+                        connect_error = Some("通信核心连接 Named Pipe 失败".into());
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        connect_error = Some("通信核心 Named Pipe 连接线程意外结束".into());
+                        break;
+                    }
+                }
+            }
+            if connected_count != 2 {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
                 unsafe {
                     CloseHandle(request_handle);
                     CloseHandle(response_handle);
                 }
-                return Err("Python 通信核心未在 10 秒内连接两条 Named Pipe".into());
+                return Err(connect_error
+                    .unwrap_or_else(|| "通信核心未在 10 秒内连接两条 Named Pipe".into()));
             }
             let request_pipe = unsafe { File::from_raw_handle(request_handle as _) };
             let response_pipe = unsafe { File::from_raw_handle(response_handle as _) };
@@ -1054,6 +1184,7 @@ struct BridgeSupervisor {
     current_generation: Arc<AtomicU64>,
     fault_tx: mpsc::Sender<BridgeFault>,
     restart_lock: Mutex<()>,
+    last_spawn_error: Mutex<Option<String>>,
     stopped: AtomicBool,
 }
 
@@ -1071,6 +1202,7 @@ impl BridgeSupervisor {
             current_generation,
             fault_tx,
             restart_lock: Mutex::new(()),
+            last_spawn_error: Mutex::new(None),
             stopped: AtomicBool::new(false),
         });
         let weak: Weak<Self> = Arc::downgrade(&supervisor);
@@ -1161,6 +1293,9 @@ impl BridgeSupervisor {
                     .current
                     .lock()
                     .expect("bridge supervisor lock poisoned") = Some(replacement);
+                if let Ok(mut last_error) = self.last_spawn_error.lock() {
+                    *last_error = None;
+                }
                 let _ = self.app.emit(
                     "bridge-restarted",
                     json!({
@@ -1171,6 +1306,16 @@ impl BridgeSupervisor {
                 );
             }
             Err(error) => {
+                if let Ok(mut last_error) = self.last_spawn_error.lock() {
+                    *last_error = Some(error.clone());
+                }
+                if let Ok(log_dir) = self.app.path().app_log_dir() {
+                    let _ = fs::create_dir_all(&log_dir);
+                    append_log(
+                        &log_dir.join("python-bridge.log"),
+                        &format!("BRIDGE START FAILED: {error}"),
+                    );
+                }
                 let _ = self.app.emit(
                     "bridge-restart-failed",
                     json!({
@@ -1186,9 +1331,16 @@ impl BridgeSupervisor {
 
     fn request(&self, method: String, params: Value, session_id: Option<u64>) -> PendingResult {
         let Some(bridge) = self.bridge() else {
+            let message = self
+                .last_spawn_error
+                .lock()
+                .ok()
+                .and_then(|error| error.clone())
+                .map(|error| format!("通信核心启动失败：{error}"))
+                .unwrap_or_else(|| "通信核心正在后台启动；界面仍可使用，请稍后重试".into());
             return Err(bridge_error(
                 "BRIDGE_STARTING",
-                "通信核心正在后台启动；界面仍可使用，请稍后重试".into(),
+                message,
                 Some(&method),
                 false,
             ));
@@ -1243,7 +1395,9 @@ impl BridgeSupervisor {
     }
 
     fn shutdown(&self) {
-        self.stopped.store(true, Ordering::Release);
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let Ok(_restart) = self.restart_lock.lock() else {
             return;
         };
@@ -1302,14 +1456,13 @@ fn open_external(url: String) -> Result<(), String> {
 }
 
 fn main() {
-    let _single_instance = match acquire_single_instance() {
+    let _single_instance = match acquire_single_instance_or_activate() {
         Ok(Some(guard)) => guard,
         Ok(None) => {
-            eprintln!("EtherCAT Workbench 已在运行；本次启动已退出。");
             return;
         }
         Err(error) => {
-            eprintln!("{error}");
+            show_startup_error(&error);
             return;
         }
     };
@@ -1319,6 +1472,21 @@ fn main() {
             let supervisor = BridgeSupervisor::new(app.handle().clone());
             app.manage(BridgeState(supervisor));
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                let supervisor = window
+                    .try_state::<BridgeState>()
+                    .map(|state| Arc::clone(&state.0));
+                std::thread::spawn(move || {
+                    if let Some(supervisor) = supervisor {
+                        supervisor.shutdown();
+                    }
+                    app.exit(0);
+                });
+            }
         })
         .invoke_handler(tauri::generate_handler![
             bridge_request,

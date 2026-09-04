@@ -1,12 +1,14 @@
 {
   "name": "ethercat-workbench-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "test": "vitest run",
     "build": "tsc --noEmit && vite build",
+    "build:bridge": "pwsh -NoLogo -NoProfile -File ../packaging/build-bridge.ps1",
+    "build:bundle": "pnpm build && pnpm build:bridge",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
