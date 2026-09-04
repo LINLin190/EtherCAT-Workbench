@@ -60,7 +60,7 @@ EtherCAT Workbench 是一款基于 **Tauri 2、Rust、React、TypeScript、Mater
 
 ### 安装与启动
 
-当前以源码运行优先。Tauri 配置中的 `bundle.active=false`，因此不保证存在安装器或 GitHub Release 安装包。
+当前发布版本使用 Tauri 2 Windows bundle 流程，仅生成简体中文界面的 NSIS（`.exe`）安装包，不再生成或发布 MSI；Npcap 不随安装包捆绑，Python 运行环境与 `pysoem==1.1.13` 仍需按运行环境要求准备。
 
 在 PowerShell 中执行：
 
@@ -222,7 +222,7 @@ flowchart LR
 
 ### 构建 Windows 应用
 
-当前 Tauri 配置为 `bundle.active=false`，不会生成可承诺的安装器。维护者可在 `desktop` 目录执行前端构建，并由 Tauri 工具链生成本地调试/应用产物：
+维护者可在 `desktop` 目录执行前端构建，并由 Tauri 工具链生成简体中文 NSIS Windows 安装器：
 
 ```powershell
 Set-Location desktop

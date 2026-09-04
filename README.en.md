@@ -39,7 +39,7 @@ The application reports actionable errors when Npcap/wpcap is missing, permissio
 
 ### Install and run
 
-The project is currently source-first. Tauri has `bundle.active=false`, so an installer or GitHub Release artifact is not guaranteed to exist. Run in PowerShell:
+Release builds use the Tauri 2 Windows bundle flow and produce only an NSIS (`.exe`) installer with a Simplified Chinese installer and uninstaller UI; MSI packages are no longer built or published. Npcap is not bundled, and the Python runtime with `pysoem==1.1.13` must be prepared separately. Run in PowerShell:
 
 ```powershell
 git clone https://github.com/LINLin190/EtherCAT-Workbench.git
@@ -121,7 +121,7 @@ Supported: ConfigData/CRC-8, Identity, standard Mailbox, Strings, General, FMMU,
 
 ### Build the Windows application
 
-The current Tauri configuration has `bundle.active=false`, so no installer artifact is promised. Maintainers can build the frontend locally:
+Maintainers can build the Simplified Chinese NSIS Windows installer locally from the `desktop` directory:
 
 ```powershell
 Set-Location desktop
