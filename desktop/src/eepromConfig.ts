@@ -110,6 +110,7 @@ export interface FixedEsiState {
 export const FLASH_HISTORY_KEY = "ethercat-workbench.eeprom-flash-history-v1";
 export const FIXED_ESI_STATE_KEY = "ethercat-workbench.eeprom-fixed-list-v1";
 export const QUICK_FLASH_TAB_KEY = "ethercat-workbench.eeprom-quick-tab-v1";
+export const EEPROM_AUTO_RESET_KEY = "ethercat-workbench.eeprom-auto-reset-v1";
 export const FLASH_HISTORY_LIMIT = 20;
 
 export function fixedEsiKey(entry: Pick<FixedEsiEntry, "path" | "ordinal">): string {
@@ -146,6 +147,15 @@ export function saveQuickFlashTab(tab: number, storage: Pick<Storage, "setItem">
   const value = tab === 1 ? 1 : 0;
   storage.setItem(QUICK_FLASH_TAB_KEY, String(value));
   return value;
+}
+
+export function loadEepromAutoReset(storage: Pick<Storage, "getItem"> = window.localStorage): boolean {
+  return storage.getItem(EEPROM_AUTO_RESET_KEY) !== "false";
+}
+
+export function saveEepromAutoReset(enabled: boolean, storage: Pick<Storage, "setItem"> = window.localStorage): boolean {
+  storage.setItem(EEPROM_AUTO_RESET_KEY, String(enabled));
+  return enabled;
 }
 
 export function loadFlashHistory(storage: Pick<Storage, "getItem"> = window.localStorage): FlashHistoryEntry[] {

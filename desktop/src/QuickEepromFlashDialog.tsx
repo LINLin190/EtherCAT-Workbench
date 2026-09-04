@@ -8,7 +8,7 @@ import {
   FolderOpenRounded, HistoryRounded, Inventory2Rounded, MemoryRounded, RestartAltRounded,
   SearchRounded, StarOutlineRounded, StarRounded,
 } from "@mui/icons-material";
-import { BridgeRequestError, bridgeRequest, pickFile, revealPath } from "./api";
+import { BridgeRequestError, bridgeRequest, onFileDrop, pickFile, revealPath } from "./api";
 import {
   decodeConfigData, fixedEsiKey, hexByte, hexWord, loadFixedEsiState, loadFlashHistory,
   loadQuickFlashTab, normalizeConfigData, saveFixedEsiState, saveFlashHistory, saveQuickFlashTab,
@@ -71,6 +71,7 @@ interface Props {
   slave?: SlaveInfo;
   status: WorkbenchStatus;
   progress?: EepromProgressState;
+  autoResetEsc: boolean;
   setProgress: (value?: EepromProgressState) => void;
   onClose: () => void;
   onOpenDetails: (selection?: EepromDetailSelection) => void;
@@ -101,7 +102,7 @@ function ConfigSummary({ title, configData, subtle = false }: {
   </Box>;
 }
 
-export function QuickEepromFlashDialog({ open, slave, status, progress, setProgress, onClose, onOpenDetails }: Props) {
+export function QuickEepromFlashDialog({ open, slave, status, progress, autoResetEsc, setProgress, onClose, onOpenDetails }: Props) {
   const [tab, setTab] = useState<0 | 1>(() => loadQuickFlashTab());
   const [query, setQuery] = useState("");
   const [library, setLibrary] = useState<LibraryResult>({ directory: "", entries: [], errors: [] });
@@ -181,16 +182,15 @@ export function QuickEepromFlashDialog({ open, slave, status, progress, setProgr
     void bridgeRequest<EepromHeader>("eeprom_header", { position: slave.position })
       .then(setHeader)
       .catch((error) => setHeaderError(error instanceof Error ? error.message : String(error)));
-    const previous = history.find((item) => item.slaveKey === contextKey);
-    if (previous) {
-      void loadXml(previous.path, previous.ordinal, previous.effectiveConfigData);
-    } else {
-      setEsi(undefined);
-      setTarget(undefined);
-      setConfigData("");
-      setOriginalConfigData("");
-    }
-  }, [contextKey, history, loadXml, open, slave]);
+    requestRef.current += 1;
+    generatedConfigRef.current = "";
+    setEsi(undefined);
+    setOrdinal(0);
+    setTarget(undefined);
+    setConfigData("");
+    setOriginalConfigData("");
+    setGenerationError("");
+  }, [contextKey, open, slave]);
 
   useEffect(() => {
     if (!open || !esi || !parsedConfig.formatted || parsedConfig.formatted === generatedConfigRef.current) return;
@@ -203,6 +203,17 @@ export function QuickEepromFlashDialog({ open, slave, status, progress, setProgr
     const path = await pickFile(["xml"]);
     if (path) await loadXml(path);
   };
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    let dispose: (() => void) | undefined;
+    void onFileDrop((paths) => {
+      const xml = paths.find((path) => path.toLowerCase().endsWith(".xml"));
+      if (xml && !operationInProgress) void loadXml(xml);
+    }).then((value) => { if (cancelled) value(); else dispose = value; });
+    return () => { cancelled = true; dispose?.(); };
+  }, [loadXml, open, operationInProgress]);
 
   const filteredHistory = useMemo(() => history.filter((item) => {
     const haystack = `${item.path} ${item.deviceName} ${item.productCode.toString(16)} ${item.effectiveConfigData}`.toLowerCase();
@@ -238,7 +249,7 @@ export function QuickEepromFlashDialog({ open, slave, status, progress, setProgr
     setResult(undefined);
     setProgress({ operation: "eeprom-flash", stage: "准备", completed: 0, total: 100, percent: 0, detail: "准备切换 INIT 并烧录", tone: "info", cancellable: true });
     try {
-      const payload = await bridgeRequest<FlashPayload>("eeprom_flash", { position: slave.position, target_id: target.target_id, auto_reset: true });
+      const payload = await bridgeRequest<FlashPayload>("eeprom_flash", { position: slave.position, target_id: target.target_id, auto_reset: autoResetEsc });
       if (!payload.success) {
         setResult({ severity: "error", text: payload.result.image_verification });
         setProgress({ operation: "eeprom-flash", stage: "镜像校验失败", completed: 100, total: 100, percent: 100, detail: payload.result.image_verification, tone: "error" });
@@ -262,7 +273,9 @@ export function QuickEepromFlashDialog({ open, slave, status, progress, setProgr
       };
       setHistory((current) => saveFlashHistory(entry, window.localStorage, current));
       const reloadFailed = payload.result.reload_verified === false;
-      const text = reloadFailed ? "镜像校验完成；复位后的重新加载复核未通过。" : "烧录、完整回读和校验已完成。";
+      const text = reloadFailed
+        ? "镜像校验完成；复位后的重新加载复核未通过。"
+        : autoResetEsc ? "烧录、完整回读和校验已完成。" : "烧录与完整回读校验已完成；未复位 ESC。";
       setResult({ severity: reloadFailed ? "warning" : "success", text });
       setProgress({ operation: "eeprom-flash", stage: reloadFailed ? "烧录完成，重新加载复核未通过" : "烧录并校验完成", completed: 100, total: 100, percent: 100, detail: text, tone: reloadFailed ? "info" : "success", cancellable: false });
     } catch (error) {
@@ -371,7 +384,7 @@ export function QuickEepromFlashDialog({ open, slave, status, progress, setProgr
             {tab === 1 && filteredLibrary.length === 0 && <Box sx={{ py: 7, px: 2, textAlign: "center", color: "text.secondary" }}><Inventory2Rounded sx={{ opacity: 0.3, fontSize: 38 }} /><Typography fontWeight={700}>固定列表为空</Typography><Typography variant="caption">{library.directory || "未找到 xml列表 目录"}</Typography></Box>}
           </List>
           {library.errors.length > 0 && tab === 1 && <Alert severity="warning" sx={{ m: 1, mt: 0 }}>{library.errors.length} 个 XML 无法解析</Alert>}
-          <Box sx={{ p: 1, borderTop: 1, borderColor: "divider", bgcolor: "background.paper" }}><Button fullWidth size="small" variant="outlined" startIcon={<FolderOpenRounded />} disabled={operationInProgress} onClick={chooseFile}>选择其他 XML</Button></Box>
+          <Box sx={{ p: 1, borderTop: 1, borderColor: "divider", bgcolor: "background.paper" }}><Button fullWidth size="small" variant="outlined" startIcon={<FolderOpenRounded />} disabled={operationInProgress} onClick={chooseFile}>选择或拖入 XML</Button></Box>
         </Box>
 
         <Box sx={{ p: 2.25, overflow: "auto", minWidth: 0 }}>
@@ -423,7 +436,7 @@ export function QuickEepromFlashDialog({ open, slave, status, progress, setProgr
     <Divider />
     <DialogActions sx={{ px: 2, py: 1.25, justifyContent: "space-between" }}>
       <Button disabled={!esi || operationInProgress} onClick={() => esi && onOpenDetails({ path: esi.path, ordinal, configData: parsedConfig.formatted ?? configData })}>进入 EEPROM 详情</Button>
-      <Stack direction="row" gap={1} alignItems="center"><Typography variant="caption" color={blocker ? "text.secondary" : "transparent"} sx={{ maxWidth: 420, textAlign: "right" }}>{blocker || "可烧录"}</Typography><Button disabled={operationInProgress} onClick={() => handleClose()}>取消</Button><Button variant="contained" color="error" startIcon={operationInProgress ? <CircularProgress size={16} color="inherit" /> : <MemoryRounded />} disabled={Boolean(blocker)} onClick={flash}>烧录</Button></Stack>
+      <Stack direction="row" gap={1} alignItems="center"><Typography variant="caption" color="text.secondary" sx={{ maxWidth: 420, textAlign: "right" }}>{blocker || (autoResetEsc ? "烧录后已自动复位 ESC" : "烧录后不复位 ESC")}</Typography><Button disabled={operationInProgress} onClick={() => handleClose()}>取消</Button><Button variant="contained" color="error" startIcon={operationInProgress ? <CircularProgress size={16} color="inherit" /> : <MemoryRounded />} disabled={Boolean(blocker)} onClick={flash}>烧录</Button></Stack>
     </DialogActions>
   </Dialog>;
 }

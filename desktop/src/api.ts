@@ -332,7 +332,7 @@ class PreviewBridge {
         for (const completed of [10, 35, 68, 100]) {
           this.emit("progress", { operation: "eeprom-flash", stage: completed < 100 ? "write-verify" : "full-verify", completed, total: 100, detail: `${completed}%`, cancellable: false });
         }
-        this.advanceSession();
+        if (params.auto_reset !== false) this.advanceSession();
         return {
           success: true,
           result: {
@@ -347,9 +347,9 @@ class PreviewBridge {
             sii_valid: true,
             semantic_valid: true,
             image_verification: "完整镜像与语义校验通过",
-            reset_sequence: [true, true, true],
-            rediscovered: true,
-            reload_verified: true,
+            reset_sequence: params.auto_reset === false ? null : [true, true, true],
+            rediscovered: params.auto_reset === false ? null : true,
+            reload_verified: params.auto_reset === false ? null : true,
           },
           slaves: this.scanned,
         } as T;

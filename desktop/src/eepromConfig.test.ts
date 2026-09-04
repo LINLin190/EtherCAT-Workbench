@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  decodeConfigData, fixedEsiKey, loadFixedEsiState, loadFlashHistory, loadQuickFlashTab, normalizeConfigData, pdiMeaning,
-  saveFixedEsiState, saveFlashHistory, saveQuickFlashTab, type FixedEsiEntry, type FlashHistoryEntry,
+  decodeConfigData, fixedEsiKey, loadEepromAutoReset, loadFixedEsiState, loadFlashHistory, loadQuickFlashTab,
+  normalizeConfigData, pdiMeaning, saveEepromAutoReset, saveFixedEsiState, saveFlashHistory, saveQuickFlashTab,
+  type FixedEsiEntry, type FlashHistoryEntry,
 } from "./eepromConfig";
 
 describe("EEPROM ConfigData helpers", () => {
@@ -76,5 +77,18 @@ describe("EEPROM ConfigData helpers", () => {
     expect(loadFixedEsiState(storage)).toEqual({ favorites: [favorite], hidden: ["c:\\device.xml|0"] });
     expect(saveQuickFlashTab(1, storage)).toBe(1);
     expect(loadQuickFlashTab(storage)).toBe(1);
+  });
+
+  it("defaults EEPROM auto reset to enabled and persists an explicit choice", () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+    };
+    expect(loadEepromAutoReset(storage)).toBe(true);
+    expect(saveEepromAutoReset(false, storage)).toBe(false);
+    expect(loadEepromAutoReset(storage)).toBe(false);
+    expect(saveEepromAutoReset(true, storage)).toBe(true);
+    expect(loadEepromAutoReset(storage)).toBe(true);
   });
 });
