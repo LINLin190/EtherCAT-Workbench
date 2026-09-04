@@ -10,3 +10,8 @@ node_modules/
 desktop/src-tauri/target/
 *.log
 /npcap-*.exe
+
+# Maintainer-local files
+/AGENTS.md
+/约束/
+/hardware-validation-backup/
