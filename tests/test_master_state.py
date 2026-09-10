@@ -80,3 +80,15 @@ def test_topology_change_during_state_update_advances_session() -> None:
     assert changed is True
     assert machine.snapshot().phase is MasterPhase.ADAPTER_OPEN
     assert machine.session_id == previous_session + 1
+
+
+
+def test_preop_leaves_pdo_configured_phase_without_changing_session():
+    machine = MasterStateMachine(BackendMode.DEMO)
+    machine.connect_succeeded("demo0")
+    machine.scan_succeeded((_slave(),))
+    machine.pdo_configured((_slave(EtherCatState.SAFE_OP),))
+    session = machine.session_id
+    machine.states_updated((_slave(EtherCatState.PRE_OP),))
+    assert machine.snapshot().phase is MasterPhase.BUS_SCANNED
+    assert machine.session_id == session

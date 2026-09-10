@@ -20,11 +20,14 @@ export interface SlaveInfo {
   identity: SlaveIdentity;
   state: number;
   al_status: number;
-  input_size: number;
-  output_size: number;
+  input_size: number | null;
+  output_size: number | null;
   configured_address?: number;
   chip_model: string;
   register_family: string;
+  raw_state?: number | null;
+  pdi_type?: number | null;
+  pdo_size_source?: "mapped" | "cache" | "sii" | "unknown";
 }
 
 export interface WorkbenchStatus {

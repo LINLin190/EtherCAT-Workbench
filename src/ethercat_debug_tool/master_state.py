@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterable
 
-from .models import BackendMode, MasterPhase, MasterSnapshot, SlaveInfo
+from .models import BackendMode, EtherCatState, MasterPhase, MasterSnapshot, SlaveInfo
 
 
 class InvalidMasterTransition(RuntimeError):
@@ -197,6 +197,10 @@ class MasterStateMachine:
                 phase = MasterPhase.ADAPTER_OPEN
             elif phase not in {MasterPhase.PDO_CONFIGURED, MasterPhase.CYCLIC}:
                 phase = MasterPhase.BUS_SCANNED if values else MasterPhase.ADAPTER_OPEN
+            elif phase is MasterPhase.PDO_CONFIGURED and any(
+                slave.state in {EtherCatState.INIT, EtherCatState.PRE_OP} for slave in values
+            ):
+                phase = MasterPhase.BUS_SCANNED
             topology_changed = self._topology(self._slaves) != self._topology(values)
             if self._phase is MasterPhase.CYCLIC and topology_changed:
                 raise InvalidMasterTransition(

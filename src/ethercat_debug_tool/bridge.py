@@ -354,19 +354,12 @@ class BridgeRuntime:
                 try:
                     if event.session_id is not None and event.session_id != self.session_id:
                         continue
-                    if event.kind == "cycle_started":
-                        self.master_state.cycle_started(
-                            event.payload or (), expected_session=event.session_id
+                    # Start/stop results are committed by the command lane. A delayed
+                    # event must not overwrite a subsequent requested slave state.
+                    if event.kind == "cycle_fault":
+                        self.master_state.cycle_faulted(
+                            str(event.payload), expected_session=event.session_id
                         )
-                    elif event.kind in {"cycle_stopped", "cycle_fault"}:
-                        if event.kind == "cycle_stopped" and event.payload is not None:
-                            self.master_state.cycle_stopped(
-                                event.payload, expected_session=event.session_id
-                            )
-                        elif event.kind == "cycle_fault":
-                            self.master_state.cycle_faulted(
-                                str(event.payload), expected_session=event.session_id
-                            )
                     elif event.kind == "slaves_changed":
                         if self.master_state.states_updated(
                             event.payload or (), expected_session=event.session_id
@@ -691,6 +684,8 @@ class BridgeRuntime:
                 raise failure
             return {"connected": False}
         if method == "scan":
+            if self.cycle_running:
+                raise RuntimeError("周期通信运行时不能重新扫描，请先停止周期通信")
             if not self.connected:
                 raise RuntimeError("Master 未连接，无法扫描从站")
             try:
@@ -726,11 +721,21 @@ class BridgeRuntime:
             self._publish_snapshot()
             return slaves
         if method == "request_state":
-            if self.cycle_running:
-                raise RuntimeError("周期通信运行时不能切换从站状态，请先停止周期通信")
             raw_position = params.get("position")
             position = None if raw_position in {None, 0} else int(raw_position)
             state = EtherCatState(int(params["state"]))
+            if self.cycle_running:
+                self._dispatch_serial("stop_cycle", {})
+            current = min((slave.state for slave in self.slaves), default=state)
+            downgrade = {
+                EtherCatState.INIT: {EtherCatState.OP: (EtherCatState.SAFE_OP, EtherCatState.PRE_OP), EtherCatState.SAFE_OP: (EtherCatState.PRE_OP,)},
+                EtherCatState.PRE_OP: {EtherCatState.OP: (EtherCatState.SAFE_OP,)},
+            }
+            for intermediate in downgrade.get(state, {}).get(current, ()):
+                self._submit("request_state", position, intermediate, 2_000_000)
+            if state is EtherCatState.OP:
+                self._dispatch_serial("start_cycle", {"period_ms": 5, "position": position})
+                return list(self.slaves)
             try:
                 slaves = list(self._submit("request_state", position, state, 2_000_000))
             except BaseException as exc:
@@ -804,14 +809,17 @@ class BridgeRuntime:
             self._submit("set_output", int(params["position"]), data)
             return {"applied": True, "data": data}
         if method == "start_cycle":
+            if self.cycle_running:
+                raise RuntimeError("周期通信已经运行")
             try:
-                self._submit(
+                result = self._submit(
                     "__start_cycle__",
                     float(params["period_ms"]),
                     2000,
                     5,
                     priority=Priority.CONTROL,
                     timeout=10,
+                    position=params.get("position") or None,
                 )
             except BaseException as exc:
                 if self._worker_stalled:
@@ -824,7 +832,7 @@ class BridgeRuntime:
                     self.master_state.cycle_faulted(str(exc), slaves)
                 self._publish_snapshot()
                 raise
-            self.master_state.cycle_started(self.slaves)
+            self.master_state.cycle_started(result[3])
             self._publish_snapshot()
             return {"running": True}
         if method == "stop_cycle":

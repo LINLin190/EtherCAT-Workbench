@@ -11,7 +11,7 @@ from enum import IntEnum, StrEnum
 from typing import Any
 
 from ..backends.base import EtherCatBackend
-from ..models import EtherCatState
+from ..models import EtherCatState, ProcessDataSnapshot, SlaveInfo
 
 
 class Priority(IntEnum):
@@ -64,6 +64,8 @@ class EtherCatWorker:
         self._max_consecutive_errors = 5
         self._needs_safe_state = False
         self._cycle_session_id: int | None = None
+        self._cycle_positions: set[int] = set()
+        self._next_state_check = 0.0
         self._state = WorkerState.STARTING
 
     @property
@@ -151,14 +153,15 @@ class EtherCatWorker:
 
     @staticmethod
     def _configure_cycle(
-        backend: EtherCatBackend, period_ms: float, timeout_us: int, max_consecutive_errors: int
-    ) -> tuple[float, int, int, object, object]:
+        backend: EtherCatBackend, period_ms: float, timeout_us: int, max_consecutive_errors: int,
+        *, position: int | None = None,
+    ) -> tuple[float, int, int, list[SlaveInfo], ProcessDataSnapshot]:
         if period_ms <= 0:
             raise ValueError("Cycle period must be positive")
         backend.map_process_data()
         backend.request_state(None, EtherCatState.SAFE_OP, 2_000_000)
         first_snapshot = backend.exchange_process_data(timeout_us)
-        slaves = backend.request_state(None, EtherCatState.OP, 2_000_000)
+        slaves = backend.request_state(position, EtherCatState.OP, 2_000_000)
         return period_ms / 1000.0, timeout_us, max_consecutive_errors, slaves, first_snapshot
 
     @staticmethod
@@ -182,6 +185,8 @@ class EtherCatWorker:
                 self._needs_safe_state = True
                 self._cycle_session_id = task.event_session_id
                 self._next_cycle = time.perf_counter()
+                self._next_state_check = self._next_cycle + 0.1
+                self._cycle_positions = {s.position for s in slaves if s.state is EtherCatState.OP}
                 self._events.put(WorkerEvent("process_data", first_snapshot, task.event_session_id))
                 self._events.put(WorkerEvent("cycle_started", slaves, task.event_session_id))
             elif task.operation == "__stop_cycle__":
@@ -220,6 +225,20 @@ class EtherCatWorker:
         try:
             snapshot = self._backend.exchange_process_data(self._cycle_timeout_us)
             self._events.put(WorkerEvent("process_data", snapshot, self._cycle_session_id))
+            if time.perf_counter() >= self._next_state_check:
+                slaves = self._backend.read_states()
+                self._next_state_check = time.perf_counter() + 0.1
+                for slave in slaves:
+                    if slave.position in self._cycle_positions and (
+                        slave.state is not EtherCatState.OP
+                        or (slave.raw_state or 0) & 0x10
+                        or slave.al_status
+                    ):
+                        raise RuntimeError(
+                            f"从站 {slave.position} 已退出正常 OP："
+                            f"AL state 0x{(slave.raw_state or int(slave.state)):02X}, "
+                            f"AL code 0x{slave.al_status:04X}"
+                        )
             if snapshot.consecutive_errors >= self._max_consecutive_errors:
                 self._cycle_period = 0.0
                 try:

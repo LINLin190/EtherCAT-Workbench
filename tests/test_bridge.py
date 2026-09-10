@@ -572,7 +572,6 @@ def test_state_repairs_are_rejected_while_cycle_runs() -> None:
         runtime.dispatch("auto_scan", {"preferred_adapter": "demo0"})
         runtime.dispatch("start_cycle", {"period_ms": 10})
         for method, params in (
-            ("request_state", {"position": 1, "state": int(EtherCatState.INIT)}),
             ("reconfig", {"position": 1}),
             ("recover", {"position": 1}),
         ):
@@ -688,5 +687,22 @@ def test_esi_library_list_returns_all_devices(workspace) -> None:
         assert result["entries"]
         assert all(entry["path"].lower().endswith(".xml") for entry in result["entries"])
         assert all(len(entry["config_data"]) >= 10 for entry in result["entries"])
+    finally:
+        runtime.shutdown()
+
+
+def test_overview_op_runs_cycle_and_downgrade_stops_it():
+    runtime = BridgeRuntime(RecordingWriter(), BackendMode.DEMO)
+    try:
+        runtime.dispatch("auto_scan", {"preferred_adapter": "demo0"})
+        states = runtime.dispatch("request_state", {"position": 1, "state": 8})
+        assert states[0].state is EtherCatState.OP
+        assert runtime.cycle_running
+        runtime.dispatch("request_state", {"position": 1, "state": 2})
+        assert not runtime.cycle_running
+        # Allow old start/stop events to arrive after the PREOP result.
+        time.sleep(0.06)
+        assert runtime.slaves[0].state is EtherCatState.PRE_OP
+        assert not runtime.cycle_running
     finally:
         runtime.shutdown()

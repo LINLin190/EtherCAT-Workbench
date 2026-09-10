@@ -58,11 +58,14 @@ class SlaveInfo:
     identity: SlaveIdentity
     state: EtherCatState
     al_status: int
-    input_size: int
-    output_size: int
+    input_size: int | None
+    output_size: int | None
     configured_address: int | None = None
     chip_model: str = "Generic ESC"
     register_family: str = "GENERIC"
+    raw_state: int | None = None
+    pdi_type: int | None = None
+    pdo_size_source: str = "mapped"
 
 
 @dataclass(frozen=True, slots=True)

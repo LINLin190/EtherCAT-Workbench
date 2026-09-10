@@ -3,7 +3,10 @@ from dataclasses import replace
 import pytest
 
 from ethercat_debug_tool.backends.mock import MockBackend
-from ethercat_debug_tool.backends.pysoem_backend import _chip_from_register
+from ethercat_debug_tool.backends.pysoem_backend import (
+    _chip_from_identification_registers,
+    _chip_from_register,
+)
 from ethercat_debug_tool.esc_profiles.profiles import ProfileRegistry, RegisterFamily
 from ethercat_debug_tool.models import AccessSemantics
 from ethercat_debug_tool.services.eeprom_service import EepromService, compare_images
@@ -156,6 +159,25 @@ def test_profiles_are_distinct_and_not_inferred_from_counts() -> None:
     )
     assert _chip_from_register(b"\xE2\x52\x00\x00") == ("E252", "LAN9252_COMPATIBLE")
     assert _chip_from_register(b"\x00\x00\x00\x00") == ("Generic ESC", "GENERIC")
+
+
+def test_authoritative_esc_identification_registers() -> None:
+    assert _chip_from_identification_registers(b"\x11", b"\x00\x00") == (
+        "ET1100",
+        "ET1100_COMPATIBLE",
+    )
+    assert _chip_from_identification_registers(b"\x00", b"\x52\x92") == (
+        "LAN9252",
+        "LAN9252_COMPATIBLE",
+    )
+    assert _chip_from_identification_registers(b"\x00", b"\x53\x92") == (
+        "LAN9253",
+        "LAN9253_COMPATIBLE",
+    )
+    assert _chip_from_identification_registers(b"\x00", b"\x00\x00") == (
+        "Generic ESC",
+        "GENERIC",
+    )
 
 
 def test_register_catalog_error_counters_and_pdi_registers() -> None:

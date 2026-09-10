@@ -61,6 +61,7 @@ const demoSlaves: SlaveInfo[] = [
     configured_address: 1001,
     chip_model: "ET1100",
     register_family: "ET1100",
+    pdi_type: 0x04,
   },
   {
     position: 2,
@@ -73,6 +74,7 @@ const demoSlaves: SlaveInfo[] = [
     configured_address: 1002,
     chip_model: "ET1200",
     register_family: "ET1100",
+    pdi_type: 0x04,
   },
   {
     position: 3,
@@ -85,6 +87,7 @@ const demoSlaves: SlaveInfo[] = [
     configured_address: 1003,
     chip_model: "LAN9252",
     register_family: "LAN9252",
+    pdi_type: 0x80,
   },
 ];
 
@@ -122,9 +125,9 @@ const previewRegisterDefinitions: RegisterDefinition[] = [
 class PreviewBridge {
   hostGeneration = 1;
   mode: Mode = "demo";
-  connected = true;
+  connected = false;
   running = false;
-  scanned: SlaveInfo[] = structuredClone(demoSlaves);
+  scanned: SlaveInfo[] = [];
   handlers = new Set<Handler>();
   sessionId = 0;
   revision = 0;
@@ -208,6 +211,10 @@ class PreviewBridge {
       case "request_state": {
         const position = Number(params.position ?? 0);
         const state = Number(params.state);
+        if (this.running || state === 8) {
+          this.scanned = this.scanned.map((slave) => ({ ...slave, state: 4 }));
+        }
+        this.running = state === 8;
         this.scanned = this.scanned.map((slave) =>
           position === 0 || position === slave.position ? { ...slave, state } : slave,
         );

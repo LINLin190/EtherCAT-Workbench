@@ -69,7 +69,7 @@ import { alStatusInfo, type AlStatusLanguage } from "./alStatus";
 import { BridgeRequestError, bridgeRequest, onBridgeEvent, onBridgeExited, onFileDrop, openExternal, pickDirectory, pickFile, previewMode, revealPath, subscribeBusSnapshot, type AdapterInfo } from "./api";
 import { minimumBusState } from "./busState";
 import { operationStore } from "./operationStore";
-import { decodeConfigData, loadEepromAutoReset, normalizeConfigData, saveEepromAutoReset } from "./eepromConfig";
+import { decodeConfigData, loadEepromAutoReset, normalizeConfigData, pdiMeaning, saveEepromAutoReset } from "./eepromConfig";
 import { QuickEepromFlashDialog, type EepromDetailSelection, type EepromProgressState } from "./QuickEepromFlashDialog";
 import type {
   BridgeEvent,
@@ -170,9 +170,9 @@ function EmptyState({ text }: { text: string }) {
   );
 }
 
-function StateChip({ state }: { state: number }) {
-  const color = state === 8 ? "success" : state === 0 ? "default" : state === 1 ? "warning" : "primary";
-  return <Chip size="small" color={color} variant={state === 8 ? "filled" : "outlined"} label={stateLabel(state)} />;
+function StateChip({ state, error = false }: { state: number; error?: boolean }) {
+  const color = error ? "error" : state === 8 ? "success" : state === 0 ? "default" : state === 1 ? "warning" : "primary";
+  return <Chip size="small" color={color} variant={state === 8 ? "filled" : "outlined"} label={`${stateLabel(state)}${error ? " + ERROR" : ""}`} />;
 }
 
 function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfile, onRegisterProfileChange, alLanguage }: { slave?: SlaveInfo; slaves: SlaveInfo[]; status: WorkbenchStatus; busy: boolean; run: Run; refresh: () => Promise<void>; registerProfile: string; onRegisterProfileChange: (profile: string) => void; alLanguage: AlStatusLanguage }) {
@@ -198,7 +198,7 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
       setSwitchingProfile(undefined);
     }
   };
-  const allOp = slaves.length > 0 && slaves.every((item) => item.state === 8);
+  const allOp = slaves.length > 0 && slaves.every((item) => item.state === 8 && !((item.raw_state ?? item.state) & 0x10) && !item.al_status);
   const alInfo = alStatusInfo(slave?.al_status ?? 0, alLanguage);
   return (
     <>
@@ -209,7 +209,7 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
         <Typography variant="caption" display="block" sx={{ mt: 0.35 }}>先刷新状态；若问题持续，请检查链路、从站供电与 AL 状态码，再进行重配置或故障恢复。</Typography>
       </Alert>}
       {!slave ? <EmptyState text="连接并扫描后，在左侧选择一个从站" /> : (
-        <Stack spacing={1.25}>
+        <Stack spacing={1.25} className="overview-cards">
           <Card sx={cardSx}>
             <CardContent>
               <Box><Typography variant="h6">运行摘要</Typography><Typography variant="caption" color="text.secondary">当前从站的运行状态与诊断信息</Typography></Box>
@@ -217,15 +217,15 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
                 <Box className="overview-metric">
                   <Typography className="section-label">当前状态</Typography>
                   <Stack direction="row" alignItems="center" gap={1} sx={{ mt: 0.45 }}>
-                    <StateChip state={slave.state} />
+                    <StateChip state={slave.state} error={Boolean((slave.raw_state ?? slave.state) & 0x10)} />
                     <Typography variant="body2" color="text.secondary">从站 {slave.position}</Typography>
                   </Stack>
                 </Box>
                 <Box className="overview-metric">
-                  <Typography className="section-label">过程数据</Typography>
+                  <Typography className="section-label">过程数据 · {slave.pdo_size_source === "sii" ? "SII 声明" : slave.pdo_size_source === "cache" ? "已缓存" : slave.pdo_size_source === "unknown" ? "未获取" : "已映射"}</Typography>
                   <Stack direction="row" divider={<Divider orientation="vertical" flexItem />} spacing={2} sx={{ mt: 0.4 }}>
-                    <Box><Typography variant="caption" color="text.secondary">输入</Typography><Typography className="mono" fontWeight={750}>{slave.input_size} B</Typography></Box>
-                    <Box><Typography variant="caption" color="text.secondary">输出</Typography><Typography className="mono" fontWeight={750}>{slave.output_size} B</Typography></Box>
+                    <Box><Typography variant="caption" color="text.secondary">输入</Typography><Typography className="mono" fontWeight={750}>{slave.input_size == null ? "未获取" : `${slave.input_size} B`}</Typography></Box>
+                    <Box><Typography variant="caption" color="text.secondary">输出</Typography><Typography className="mono" fontWeight={750}>{slave.output_size == null ? "未获取" : `${slave.output_size} B`}</Typography></Box>
                   </Stack>
                 </Box>
                 <Box className="overview-metric overview-esc-selector">
@@ -251,6 +251,7 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
                 <Chip size="small" variant="outlined" label={slave.configured_address === undefined ? "配置地址：未知" : `配置地址：${hex(slave.configured_address)}`} />
               </Stack>
               <Box className="kv-grid overview-identity-grid">
+                <Box className="kv-item overview-identity-item"><Typography className="section-label">PDI 类型（当前生效）</Typography><Typography className="kv-value" fontWeight={700} title={slave.pdi_type == null ? "未获取" : pdiMeaning(slave.pdi_type)}>{slave.pdi_type == null ? "未获取" : `${pdiMeaning(slave.pdi_type)} · ${hex(slave.pdi_type, 2)}`}</Typography></Box>
                 <Box className="kv-item overview-identity-item"><Typography className="section-label">厂商 ID / Vendor ID</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.identity.vendor_id, 8)}</Typography></Box>
                 <Box className="kv-item overview-identity-item"><Typography className="section-label">产品代码 / Product Code</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.identity.product_code, 8)}</Typography></Box>
                 <Box className="kv-item overview-identity-item"><Typography className="section-label">修订版本 / Revision</Typography><Typography className="kv-value mono" fontWeight={700}>{hex(slave.identity.revision, 8)}</Typography></Box>
@@ -261,14 +262,15 @@ function OverviewPage({ slave, slaves, status, busy, run, refresh, registerProfi
           <Card sx={cardSx}>
             <CardContent>
               <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
-                <Box><Typography variant="h6">状态控制</Typography><Typography variant="caption" color="text.secondary">请求由后台串行执行，完成后重新读取总线状态。</Typography></Box>
+                <Box><Typography variant="h6">状态控制</Typography><Typography variant="caption" color="text.secondary">OP 自动维持 5 ms 总线周期；切换状态会先停止已有周期并让全部从站回到 SAFEOP。</Typography></Box>
                 <Chip size="small" variant="outlined" label={allOp ? "总线已就绪" : `${slaves.length} 个从站`} />
               </Stack>
               <Box className="overview-control-row">
                 <Stack direction="row" gap={0.45} flexWrap="wrap" alignItems="center">
-                  {[1, 2, 4, 8].map((state, index) => <Stack direction="row" alignItems="center" gap={0.45} key={state}>{index > 0 && <Typography className="state-flow-arrow">→</Typography>}<Button disabled={busy || status.cycle_running} variant={slave.state === state ? "contained" : "outlined"} onClick={() => requestState(state)}>{stateLabel(state)}</Button></Stack>)}
+                  {[1, 2, 4, 8].map((state, index) => <Stack direction="row" alignItems="center" gap={0.45} key={state}>{index > 0 && <Typography className="state-flow-arrow">→</Typography>}<Button disabled={busy} variant={slave.state === state ? "contained" : "outlined"} onClick={() => requestState(state)}>{stateLabel(state)}</Button></Stack>)}
                 </Stack>
                 <Stack direction="row" gap={0.5} className="overview-repair-actions">
+                  {status.cycle_running && <Button disabled={busy} size="small" color="error" variant="outlined" startIcon={<StopRounded />} onClick={() => run(() => bridgeRequest("stop_cycle"), "周期通信已停止，全部从站回到 SAFEOP")}>停止周期</Button>}
                   <Button disabled={busy || status.cycle_running} size="small" color="warning" variant="outlined" onClick={() => repair("reconfig", "重配置完成")}>重配置</Button>
                   <Button disabled={busy || status.cycle_running} size="small" color="warning" variant="outlined" onClick={() => repair("recover", "恢复并通过状态复核")}>故障恢复</Button>
                 </Stack>
@@ -815,6 +817,7 @@ function EepromPage({ slave, status, progress, setProgress, run, readResult, set
 }
 
 export default function App() {
+  const startupScanAttempted = useRef(false);
   const requestedPage = new URLSearchParams(window.location.search).get("page") as PageKey | null;
   const [page, setPage] = useState<PageKey>(pages.some((item) => item.key === requestedPage) ? requestedPage! : "overview");
   const [status, setStatus] = useState<WorkbenchStatus>({ host_generation: 0, mode: "real", phase: "disconnected", connected: false, cycle_running: false, slaves: [], session_id: 0, revision: 0 });
@@ -852,13 +855,11 @@ export default function App() {
       ? "请先连接 EtherCAT 网卡"
       : !status.slaves.length
         ? "请先扫描从站"
-        : status.cycle_running
-          ? "请先停止周期通信"
-          : eepromExclusive
-            ? "EEPROM 操作期间不能切换状态"
-            : busy
-              ? "请等待当前硬件操作完成"
-              : "";
+        : eepromExclusive
+          ? "EEPROM 操作期间不能切换状态"
+          : busy
+            ? "请等待当前硬件操作完成"
+            : "";
 
   useEffect(() => subscribeBusSnapshot((next) => {
     const previousClock = appliedClockRef.current;
@@ -915,6 +916,38 @@ export default function App() {
     setAdapter(ordered.some((item) => item.name === preferred) ? preferred : ordered[0]?.name ?? "");
   }, []);
 
+  const autoScan = useCallback(async () => {
+    const preferred = window.localStorage.getItem(PREFERRED_ADAPTER_KEY) ?? "";
+    const result = await run(() => bridgeRequest<AutoScanResult>("auto_scan", { preferred_adapter: preferred }));
+    if (!result) return;
+
+    const ordered = orderAdapters(result.adapters);
+    const selected = result.selected_adapter || preferred;
+    setAdapters(ordered);
+    setAdapter(ordered.some((item) => item.name === selected) ? selected : ordered[0]?.name ?? "");
+    if (result.connected && result.slaves.length) {
+      if (result.selected_adapter) window.localStorage.setItem(PREFERRED_ADAPTER_KEY, result.selected_adapter);
+      const adapterName = result.adapters.find((item) => item.name === result.selected_adapter)?.description
+        || result.selected_adapter;
+      setMessage({ text: `已在 ${adapterName} 上发现 ${result.slaves.length} 个从站`, severity: "success" });
+      return;
+    }
+
+    if (!result.adapters.length) {
+      setMessage({ text: "未枚举到网卡：pySOEM 没有返回可用适配器。请检查 Npcap、WinPcap 兼容模式和网卡驱动。", severity: "error" });
+      return;
+    }
+    const failed = result.attempts.filter((attempt) => attempt.error);
+    const openedWithoutSlaves = result.attempts.filter((attempt) => !attempt.error && attempt.slave_count === 0);
+    if (failed.length && failed.length === result.attempts.length) {
+      setMessage({ text: `已枚举到 ${result.adapters.length} 个网卡，但全部无法打开：${failed[0].error}`, severity: "error" });
+    } else if (openedWithoutSlaves.length) {
+      setMessage({ text: `网卡已打开并完成 EtherCAT 探测，但没有从站响应。请检查专用网线、链路和从站供电；另有 ${failed.length} 个网卡打开失败。`, severity: "info" });
+    } else {
+      setMessage({ text: `自动扫描未发现从站：已尝试 ${result.attempts.length} 个网卡。请检查 Npcap 权限、链路和从站供电。`, severity: "info" });
+    }
+  }, [run]);
+
   useEffect(() => {
     const disableBrowserContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", disableBrowserContextMenu);
@@ -942,6 +975,10 @@ export default function App() {
         applyAdapters(items);
         bootstrappedGeneration = current.host_generation;
         bootstrapPending = false;
+        if (!current.connected && !startupScanAttempted.current) {
+          startupScanAttempted.current = true;
+          await autoScan();
+        }
       } catch (error) {
         if (!active) return;
         const text = error instanceof Error ? error.message : String(error);
@@ -1032,42 +1069,11 @@ export default function App() {
     }).then((value) => { if (active) unlistenExit = value; else value(); });
     Promise.all([eventReady, exitReady]).then(() => { if (active) bootstrap(); });
     return () => { active = false; unlisten?.(); unlistenExit?.(); };
-  }, [applyAdapters]);
+  }, [applyAdapters, autoScan]);
 
   const connect = async () => {
     if (status.connected) await run(() => bridgeRequest("disconnect"), "已断开网卡");
     else await run(() => bridgeRequest("connect", { adapter }), "网卡已连接");
-  };
-  const autoScan = async () => {
-    const preferred = window.localStorage.getItem(PREFERRED_ADAPTER_KEY) ?? "";
-    const result = await run(() => bridgeRequest<AutoScanResult>("auto_scan", { preferred_adapter: preferred }));
-    if (!result) return;
-
-    const ordered = orderAdapters(result.adapters);
-    const selected = result.selected_adapter || preferred;
-    setAdapters(ordered);
-    setAdapter(ordered.some((item) => item.name === selected) ? selected : ordered[0]?.name ?? "");
-    if (result.connected && result.slaves.length) {
-      if (result.selected_adapter) window.localStorage.setItem(PREFERRED_ADAPTER_KEY, result.selected_adapter);
-      const adapterName = result.adapters.find((item) => item.name === result.selected_adapter)?.description
-        || result.selected_adapter;
-      setMessage({ text: `已在 ${adapterName} 上发现 ${result.slaves.length} 个从站`, severity: "success" });
-      return;
-    }
-
-    if (!result.adapters.length) {
-      setMessage({ text: "未枚举到网卡：pySOEM 没有返回可用适配器。请检查 Npcap、WinPcap 兼容模式和网卡驱动。", severity: "error" });
-      return;
-    }
-    const failed = result.attempts.filter((attempt) => attempt.error);
-    const openedWithoutSlaves = result.attempts.filter((attempt) => !attempt.error && attempt.slave_count === 0);
-    if (failed.length && failed.length === result.attempts.length) {
-      setMessage({ text: `已枚举到 ${result.adapters.length} 个网卡，但全部无法打开：${failed[0].error}`, severity: "error" });
-    } else if (openedWithoutSlaves.length) {
-      setMessage({ text: `网卡已打开并完成 EtherCAT 探测，但没有从站响应。请检查专用网线、链路和从站供电；另有 ${failed.length} 个网卡打开失败。`, severity: "info" });
-    } else {
-      setMessage({ text: `自动扫描未发现从站：已尝试 ${result.attempts.length} 个网卡。请检查 Npcap 权限、链路和从站供电。`, severity: "info" });
-    }
   };
   const scan = async () => {
     const found = await run(() => bridgeRequest<SlaveInfo[]>("scan"));
@@ -1175,7 +1181,7 @@ export default function App() {
         </Toolbar>
       </AppBar>
       <Box sx={{ display: "flex", minHeight: 0, flex: 1 }}>
-        {status.slaves.length > 0 && <Box component="aside" sx={{ width: { xs: 210, xl: 224 }, flexShrink: 0, bgcolor: "background.paper", borderRight: 1, borderColor: "divider", overflow: "auto", p: 0.75 }}><Stack direction="row" justifyContent="space-between" alignItems="center" gap={0.5} sx={{ px: 0.75, py: 0.55 }}><Typography variant="overline" color="text.secondary" sx={{ flexShrink: 0 }}>从站 · {status.slaves.length}</Typography><Stack direction="row" alignItems="center" gap={0.45} minWidth={0}><Tooltip title="总线状态取全部从站的最低状态"><span><StateChip state={busState!} /></span></Tooltip><Chip size="small" variant="outlined" label={status.cycle_running ? "周期运行" : "周期停止"} /></Stack></Stack><List dense sx={{ pt: 0.35 }}>{status.slaves.map((item) => <ListItemButton disabled={eepromExclusive} key={item.position} selected={item.position === selectedPosition} onClick={() => setSelectedPosition(item.position)} onContextMenu={(event) => openSlaveContextMenu(event, item.position)} sx={{ mb: 0.25, py: 0.55, px: 0.75 }}><ListItemIcon sx={{ minWidth: 30 }}><DeveloperBoardRounded fontSize="small" color={item.state === 8 ? "success" : "action"} /></ListItemIcon><ListItemText primary={`${item.position}. ${item.name}`} secondary={`${stateLabel(item.state)} · ${item.input_size}/${item.output_size} B · ${item.chip_model}`} primaryTypographyProps={{ noWrap: true, fontWeight: 650, fontSize: 12.5 }} secondaryTypographyProps={{ noWrap: true, fontSize: 11.5 }} /></ListItemButton>)}</List></Box>}
+        {status.slaves.length > 0 && <Box component="aside" sx={{ width: { xs: 210, xl: 224 }, flexShrink: 0, bgcolor: "background.paper", borderRight: 1, borderColor: "divider", overflow: "auto", p: 0.75 }}><Stack direction="row" justifyContent="space-between" alignItems="center" gap={0.5} sx={{ px: 0.75, py: 0.55 }}><Typography variant="overline" color="text.secondary" sx={{ flexShrink: 0 }}>从站 · {status.slaves.length}</Typography><Stack direction="row" alignItems="center" gap={0.45} minWidth={0}><Tooltip title="总线状态取全部从站的最低状态"><span><StateChip state={busState!} /></span></Tooltip><Chip size="small" variant="outlined" label={status.cycle_running ? "周期运行" : "周期停止"} /></Stack></Stack><List dense sx={{ pt: 0.35 }}>{status.slaves.map((item) => <ListItemButton disabled={eepromExclusive} key={item.position} selected={item.position === selectedPosition} onClick={() => setSelectedPosition(item.position)} onContextMenu={(event) => openSlaveContextMenu(event, item.position)} sx={{ mb: 0.25, py: 0.55, px: 0.75 }}><ListItemIcon sx={{ minWidth: 30 }}><DeveloperBoardRounded fontSize="small" color={item.state === 8 ? "success" : "action"} /></ListItemIcon><ListItemText primary={`${item.position}. ${item.name}`} secondary={`${stateLabel(item.state)}${(item.raw_state ?? item.state) & 0x10 ? " + ERROR" : ""} · ${item.input_size ?? "—"}/${item.output_size ?? "—"} B · ${item.chip_model}`} primaryTypographyProps={{ noWrap: true, fontWeight: 650, fontSize: 12.5 }} secondaryTypographyProps={{ noWrap: true, fontSize: 11.5 }} /></ListItemButton>)}</List></Box>}
         <Box component="main" sx={{ flex: 1, minWidth: 0, overflow: "auto", p: { xs: 1.5, xl: 2 } }}><Box sx={{ width: "100%", maxWidth: 1840, mx: "auto" }}>{bridgeExit && <Alert severity="error" action={bridgeExit.log_path ? <Button color="inherit" size="small" onClick={() => revealPath(bridgeExit.log_path!)}>打开日志</Button> : undefined} sx={{ mb: 1.25 }}><Typography fontWeight={700}>通信核心已退出</Typography><Typography variant="body2">{bridgeExit.message}</Typography>{bridgeExit.log_path && <Typography variant="caption" className="mono" sx={{ overflowWrap: "anywhere" }}>日志：{bridgeExit.log_path}</Typography>}</Alert>}{content}</Box></Box>
       </Box>
     </Box>

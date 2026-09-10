@@ -184,3 +184,26 @@ def test_worker_queue_is_bounded_during_native_stall() -> None:
     first.result(timeout=1)
     second.result(timeout=1)
     assert worker.shutdown()
+
+
+
+def test_cycle_detects_slave_leaving_op_even_with_good_wkc():
+    worker = EtherCatWorker(MockBackend)
+    worker.start()
+    try:
+        worker.submit("connect", "demo0").result(timeout=2)
+        worker.submit("scan").result(timeout=2)
+        worker.start_cycle(5, 1000).result(timeout=2)
+        worker.submit("request_state", 1, EtherCatState.SAFE_OP, 1000).result(timeout=2)
+        deadline = time.monotonic() + 1
+        events = []
+        while time.monotonic() < deadline:
+            events.extend(worker.poll_events())
+            if any(event.kind == "cycle_fault" for event in events):
+                break
+            time.sleep(0.005)
+        assert any(event.kind == "cycle_fault" and "退出正常 OP" in str(event.payload) for event in events)
+        states = worker.submit("read_states").result(timeout=2)
+        assert all(slave.state is EtherCatState.SAFE_OP for slave in states)
+    finally:
+        worker.shutdown()
