@@ -7,6 +7,7 @@ from ethercat_debug_tool.models import EtherCatState, SlaveIdentity, SlaveInfo
 class FakeSlave:
     def __init__(self, name: str, al_status: int, al_code: int) -> None:
         self.name = name
+        self.state = al_status
         self.al_status = al_status
         self._al_code = al_code
 
@@ -86,6 +87,7 @@ def test_read_states_reuses_static_scan_information(monkeypatch) -> None:
             0x1001,
             "E253",
             "LAN9253_COMPATIBLE",
+            raw_state=8,
         )
     ]
 
@@ -127,8 +129,64 @@ def test_discovery_register_probes_use_a_short_bounded_timeout(monkeypatch) -> N
     info = backend._info(1, slave)
 
     assert info.name == "Motor"
-    assert [call[2] for call in slave.calls] == [DISCOVERY_FPRD_TIMEOUT_US] * 3
+    assert [call[2] for call in slave.calls] == [DISCOVERY_FPRD_TIMEOUT_US] * 6
+    assert info.input_size is None and info.output_size is None
+    assert info.pdi_type is None
     assert DISCOVERY_FPRD_TIMEOUT_US <= 2_000
+
+
+@pytest.mark.parametrize(
+    ("esc_type", "chip_id", "expected_model", "expected_family"),
+    [
+        (b"\x11", b"\x00\x00", "ET1100", "ET1100_COMPATIBLE"),
+        (b"\x00", b"\x52\x92", "LAN9252", "LAN9252_COMPATIBLE"),
+        (b"\x00", b"\x53\x92", "LAN9253", "LAN9253_COMPATIBLE"),
+    ],
+)
+def test_discovery_uses_authoritative_esc_identification_registers(
+    monkeypatch,
+    esc_type: bytes,
+    chip_id: bytes,
+    expected_model: str,
+    expected_family: str,
+) -> None:
+    class IdentifiedSlave:
+        name = "Motor"
+        man = 1
+        id = 2
+        rev = 3
+        state = int(EtherCatState.PRE_OP)
+        al_status = 0
+        input = b""
+        output = b""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def _fprd(self, address: int, size: int, timeout_us: int) -> bytes:
+            self.calls.append((address, size))
+            values = {
+                (0x0010, 2): b"\x01\x10",
+                (0x0140, 1): b"\x80",
+                (0x0000, 1): esc_type,
+                (0x0E02, 2): chip_id,
+                (0x0004, 3): b"\x00\x00\x00",
+            }
+            return values[(address, size)]
+
+    slave = IdentifiedSlave()
+    backend = PysoemBackend()
+    monkeypatch.setattr(backend, "_serial", lambda _: 0)
+
+    info = backend._info(1, slave)
+
+    assert info.chip_model == expected_model
+    assert info.register_family == expected_family
+    assert (0x0000, 1) in slave.calls
+    if esc_type == b"\x11":
+        assert (0x0E02, 2) not in slave.calls
+    else:
+        assert (0x0E02, 2) in slave.calls
 
 
 def test_disconnect_clears_internal_state_even_when_master_close_fails() -> None:
@@ -149,3 +207,241 @@ def test_disconnect_clears_internal_state_even_when_master_close_fails() -> None
     assert backend.connected is False
     assert backend._mapped is False
     assert backend._slaves == []
+
+
+class StateSlave:
+    name = "IO"
+    man, id, rev = 1, 2, 3
+    al_status = 0
+    input = b""
+    output = b""
+
+    def __init__(self, master, actual=2):
+        self.master = master
+        self.actual = self.state = actual
+        self.writes = []
+        self.reject_preop = False
+
+    def write_state(self):
+        self.writes.append(self.state)
+        if self.state & 0x10:
+            self.actual = self.state & 0x0F
+            self.al_status = 0
+        elif self.state == 8:
+            self.actual = 4
+        elif self.state == 2 and self.reject_preop:
+            self.actual = 0x12
+            self.al_status = 0x16
+        else:
+            self.actual = self.state
+
+    def state_check(self, expected, timeout):
+        if expected == 8 and self.master.exchanges >= 3:
+            self.actual = 8
+        self.state = self.actual
+        # Match ecx_statecheck: its return value discards ErrorInd.
+        return self.actual & 0x0F
+
+    def _fprd(self, address, size, timeout):
+        if address == 0x0134:
+            return self.al_status.to_bytes(2, "little")
+        if address == 0x0140:
+            return b"\x80"
+        return bytes(size)
+
+    def eeprom_read(self, word, timeout=20000):
+        raise RuntimeError("SII unavailable")
+
+    def reconfig(self, timeout):
+        return True
+
+    def recover(self, timeout):
+        return True
+
+
+class StateMaster:
+    manual_state_change = False
+    expected_wkc = 3
+
+    def __init__(self):
+        self.slaves = [StateSlave(self)]
+        self.exchanges = 0
+        self.maps = 0
+        self.state = 2
+        self.wkc = 3
+
+    def read_state(self):
+        for slave in self.slaves:
+            slave.state = slave.actual
+        self.state = min(s.state for s in self.slaves)
+
+    def write_state(self):
+        for slave in self.slaves:
+            slave.state = self.state
+            slave.write_state()
+
+    def state_check(self, expected, timeout):
+        self.state = min(s.state_check(expected, timeout) for s in self.slaves)
+        return self.state
+
+    def config_init(self, *args, **kwargs):
+        self.slaves = [StateSlave(self)]
+        return 1
+
+    def config_map(self):
+        assert all(s.actual == 2 for s in self.slaves)
+        assert self.manual_state_change is True
+        self.maps += 1
+        self.slaves[0].input = bytes(6)
+        self.slaves[0].output = bytes(2)
+        return 8
+
+    def send_processdata(self, **kwargs):
+        self.exchanges += 1
+
+    def receive_processdata(self, *args, **kwargs):
+        return self.wkc
+
+
+def state_backend():
+    backend = PysoemBackend()
+    backend._master = StateMaster()
+    backend._connected = True
+    backend.scan()
+    return backend
+
+
+def test_op_wait_exchanges_until_slave_is_ready():
+    backend = state_backend()
+    states = backend.request_state(None, EtherCatState.OP, 100000)
+    assert states[0].state is EtherCatState.OP
+    assert backend._master.exchanges >= 3
+    assert backend._master.maps == 1
+    assert backend._master.manual_state_change is False
+    assert (states[0].input_size, states[0].output_size) == (6, 2)
+    assert states[0].pdo_size_source == "mapped"
+
+
+def test_op_with_bad_wkc_is_not_reported_as_success():
+    backend = state_backend()
+    backend._master.wkc = 0
+    with pytest.raises(Exception, match="WKC"):
+        backend.request_state(None, EtherCatState.OP, 5000)
+
+
+def test_error_ack_precedes_state_request(caplog):
+    backend = state_backend()
+    slave = backend._master.slaves[0]
+    slave.actual = 0x14
+    slave.al_status = 0x1B
+    backend.request_state(1, EtherCatState.PRE_OP, 1000)
+    assert slave.writes[:2] == [0x14, 2]
+    assert "code 0x001B" in caplog.text
+
+
+def test_preop_error_bit_is_preserved_and_rejected():
+    backend = state_backend()
+    backend._master.slaves[0].reject_preop = True
+    with pytest.raises(Exception, match="actual 0x12"):
+        backend.request_state(1, EtherCatState.PRE_OP, 1000)
+    state = backend.read_states()[0]
+    assert state.state is EtherCatState.PRE_OP
+    assert state.raw_state == 0x12
+
+
+def test_init_to_op_prepares_preop_before_mapping():
+    backend = state_backend()
+    backend._master.slaves[0].actual = 1
+    backend.request_state(None, EtherCatState.OP, 100000)
+    assert backend._master.slaves[0].writes[0] == 2
+
+
+@pytest.mark.parametrize("operation", ["scan", "reconfig", "recover", "init"])
+def test_mapping_is_rebuilt_after_configuration_invalidates_it(operation):
+    backend = state_backend()
+    backend.request_state(None, EtherCatState.SAFE_OP, 100000)
+    if operation == "init":
+        backend.request_state(None, EtherCatState.INIT, 100000)
+    elif operation == "scan":
+        backend.scan()
+    else:
+        getattr(backend, operation)(1, 1000)
+    assert backend._mapped is False
+    backend.request_state(None, EtherCatState.SAFE_OP, 100000)
+    assert backend._master.maps == 2
+
+
+def test_scan_keeps_live_pdi_without_mapping():
+    backend = state_backend()
+    assert backend._slaves[0].pdi_type == 0x80
+    assert backend._master.maps == 0
+    assert backend._slaves[0].input_size is None
+
+
+def test_sii_scan_reads_declared_sm_sizes_without_mailbox():
+    image = bytearray(256)
+    image[0x7C:0x7E] = (1).to_bytes(2, "little")
+    image[0x80:0x84] = bytes.fromhex("29 00 10 00")
+    image[0x84:0xA4] = bytes.fromhex(
+        "00 10 80 00 26 00 01 01 80 10 80 00 22 00 01 02 "
+        "00 11 02 00 64 00 01 03 00 14 06 00 20 00 01 04"
+    )
+
+    class EepromSlave:
+        def eeprom_read(self, word, timeout):
+            assert timeout == DISCOVERY_FPRD_TIMEOUT_US
+            return bytes(image[word * 2:word * 2 + 4])
+
+    assert PysoemBackend()._sii_pdo_sizes(EepromSlave()) == (6, 2)
+    image[0x82:0x84] = bytes.fromhex("FF FF")
+    assert PysoemBackend()._sii_pdo_sizes(EepromSlave()) == (None, None)
+
+
+
+def test_example_slave_sii_declares_six_input_and_two_output_bytes(workspace):
+    from ethercat_debug_tool.esi.parser import EsiParser
+    from ethercat_debug_tool.sii.generator import SiiGenerator
+
+    device = EsiParser().parse(
+        workspace / "示例从站" / "F28335_LAN9252_ECAT_IO" / "E252-EVB-SPI.xml"
+    ).devices[0]
+    image = SiiGenerator().generate(device).image
+
+    class ExampleSlave:
+        def eeprom_read(self, word, timeout):
+            return image[word * 2:word * 2 + 4]
+
+    assert PysoemBackend()._sii_pdo_sizes(ExampleSlave()) == (6, 2)
+
+
+def test_failed_rescan_clears_old_mapping_and_topology(monkeypatch):
+    backend = state_backend()
+    backend.request_state(None, EtherCatState.SAFE_OP, 100000)
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("link lost")
+
+    monkeypatch.setattr(backend._master, "config_init", failed)
+    with pytest.raises(Exception, match="link lost"):
+        backend.scan()
+    assert backend._mapped is False
+    assert backend._slaves == []
+
+
+def test_failed_error_ack_does_not_attempt_requested_state(monkeypatch):
+    backend = state_backend()
+    slave = backend._master.slaves[0]
+    slave.actual = 0x14
+    monkeypatch.setattr(slave, "state_check", lambda *args: 0x14)
+    with pytest.raises(Exception, match="actual 0x14"):
+        backend.request_state(1, EtherCatState.PRE_OP, 1000)
+    assert slave.writes == [0x14]
+
+
+def test_worker_setup_maps_once_and_keeps_pdo_exchange_in_op_wait():
+    from ethercat_debug_tool.worker.ethercat_worker import EtherCatWorker
+
+    backend = state_backend()
+    EtherCatWorker._configure_cycle(backend, 5, 2000, 5)
+    assert backend._master.maps == 1
+    assert backend._master.exchanges >= 3

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes.util
+import logging
 import time
 from dataclasses import replace
 from typing import Any
@@ -23,6 +24,7 @@ from .base import CommunicationError, EnvironmentError
 # room for a loaded Windows host without allowing one probe to consume the
 # whole scan deadline.
 DISCOVERY_FPRD_TIMEOUT_US = 2_000
+logger = logging.getLogger(__name__)
 
 
 def _decode_adapter_description(value: object) -> str:
@@ -61,6 +63,22 @@ def _chip_from_register(
     return "Generic ESC", "GENERIC"
 
 
+def _chip_from_identification_registers(
+    esc_type: bytes,
+    chip_id: bytes,
+) -> tuple[str, str]:
+    """Resolve the ESC using its authoritative identification registers."""
+    if esc_type and esc_type[0] == 0x11:
+        return "ET1100", "ET1100_COMPATIBLE"
+    if len(chip_id) >= 2:
+        model = int.from_bytes(chip_id[:2], "little")
+        if model == 0x9252:
+            return "LAN9252", "LAN9252_COMPATIBLE"
+        if model == 0x9253:
+            return "LAN9253", "LAN9253_COMPATIBLE"
+    return "Generic ESC", "GENERIC"
+
+
 class PysoemBackend:
     """Thin pySOEM adapter. Every method must be invoked only by EtherCatWorker."""
 
@@ -74,6 +92,7 @@ class PysoemBackend:
         self._wkc_errors = 0
         self._timeouts = 0
         self._consecutive = 0
+        self._pdo_size_cache: dict[tuple[int, int, int], tuple[int, int]] = {}
 
     @property
     def connected(self) -> bool:
@@ -151,15 +170,49 @@ class PysoemBackend:
         except Exception:
             return 0
 
-    def _pdo_size(self, position: int, direction: PdoDirection) -> int:
+    def _sii_pdo_sizes(self, slave: Any) -> tuple[int | None, int | None]:
+        """Read declared SM lengths without configuring PDOs or waiting on CoE."""
+        deadline = time.monotonic() + 0.1
+
+        def read(word: int) -> bytes:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("SII discovery deadline exceeded")
+            value = slave.eeprom_read(word, timeout=DISCOVERY_FPRD_TIMEOUT_US)
+            if len(value) != 4:
+                raise ValueError("Truncated SII word read")
+            return value
+
         try:
-            bits = sum(entry.bit_length for entry in self.read_pdo_mapping(position, direction))
-            return (bits + 7) // 8
-        except CommunicationError:
-            return 0
+            capacity_words = (int.from_bytes(read(0x3E)[:2], "little") + 1) * 64
+            word = 0x40
+            for _ in range(128):
+                if word + 2 > min(capacity_words, 0x10000):
+                    break
+                header = read(word)
+                kind = int.from_bytes(header[:2], "little")
+                length = int.from_bytes(header[2:], "little")
+                if kind == 0xFFFF or word + 2 + length > min(capacity_words, 0x10000):
+                    break
+                if kind == 0x0029:
+                    if length % 4 or length > 16 * 4:
+                        break
+                    sizes: dict[int, int | None] = {3: 0, 4: 0}
+                    for offset in range(word + 2, word + 2 + length, 4):
+                        sm = read(offset) + read(offset + 2)
+                        if sm[7] in sizes and sm[6] & 1:
+                            size = int.from_bytes(sm[2:4], "little")
+                            previous = sizes[sm[7]]
+                            # An enabled SM with no default length needs online mapping.
+                            sizes[sm[7]] = previous + size if size and previous is not None else None
+                    return sizes[4], sizes[3]
+                word += 2 + length
+        except Exception:
+            pass
+        return None, None
 
     def _info(self, position: int, slave: Any) -> SlaveInfo:
         configured_address = None
+        pdi_type = None
         chip_model, family = "Generic ESC", "GENERIC"
         try:
             configured_address = int.from_bytes(
@@ -167,18 +220,35 @@ class PysoemBackend:
             )
         except Exception:
             pass
-        chip_raw = b""
         try:
-            chip_raw = slave._fprd(0x0E00, 4, DISCOVERY_FPRD_TIMEOUT_US)
+            pdi_type = slave._fprd(0x0140, 1, DISCOVERY_FPRD_TIMEOUT_US)[0]
         except Exception:
-            # Some ESCs reject reads in the 0x0E00 area; the capability
-            # signature below still identifies original vendor chips.
             pass
+        esc_type = b""
+        try:
+            esc_type = slave._fprd(0x0000, 1, DISCOVERY_FPRD_TIMEOUT_US)
+        except Exception:
+            pass
+        chip_id = b""
+        try:
+            if not (esc_type and esc_type[0] == 0x11):
+                chip_id = slave._fprd(0x0E02, 2, DISCOVERY_FPRD_TIMEOUT_US)
+        except Exception:
+            pass
+        chip_model, family = _chip_from_identification_registers(esc_type, chip_id)
+        chip_raw = b""
+        if chip_model == "Generic ESC":
+            try:
+                chip_raw = slave._fprd(0x0E00, 4, DISCOVERY_FPRD_TIMEOUT_US)
+            except Exception:
+                # Some ESCs reject reads in the 0x0E00 area; the capability
+                # signature below still identifies original vendor chips.
+                pass
         try:
             capabilities = slave._fprd(0x0004, 3, DISCOVERY_FPRD_TIMEOUT_US)
         except Exception:
             capabilities = None
-        if capabilities is not None or chip_raw:
+        if chip_model == "Generic ESC" and (capabilities is not None or chip_raw):
             chip_model, family = _chip_from_register(
                 chip_raw,
                 fmmu_count=capabilities[0] if capabilities is not None else None,
@@ -189,21 +259,34 @@ class PysoemBackend:
             state = EtherCatState(int(slave.state) & 0x0F)
         except ValueError:
             state = EtherCatState.NONE
+        # Do not stream-read SII during discovery. LAN9252 firmware may retain
+        # EEPROM ownership after a direct read, causing its INIT->PREOP check
+        # to report AL 0x0050 (EEPROM no access). Sizes become authoritative
+        # after config_map() and are then published as mapped lengths.
+        key = (int(slave.man), int(slave.id), int(slave.rev))
+        input_size, output_size = self._pdo_size_cache.get(key, (None, None))
         return SlaveInfo(
             position,
             slave.name,
-            SlaveIdentity(slave.man, slave.id, slave.rev, self._serial(slave)),
+            # Serial is intentionally omitted during discovery; direct EEPROM
+            # reads can retain LAN9252 EEPROM ownership until a reset.
+            SlaveIdentity(slave.man, slave.id, slave.rev, 0),
             state,
             int(slave.al_status),
-            len(slave.input),
-            len(slave.output),
+            input_size,
+            output_size,
             configured_address,
             chip_model,
             family,
+            raw_state=int(slave.state),
+            pdi_type=pdi_type,
+            pdo_size_source="cache" if input_size is not None else "unknown",
         )
 
     def scan(self) -> list[SlaveInfo]:
         master = self._require_master()
+        self._mapped = False
+        self._slaves = []
         try:
             count = master.config_init(False, release_gil=True)
         except Exception as exc:
@@ -211,7 +294,18 @@ class PysoemBackend:
         if count <= 0:
             self._slaves = []
             return []
+        master.read_state()
         self._slaves = [self._info(i, slave) for i, slave in enumerate(master.slaves, 1)]
+        # Establish fixed PDO widths once during discovery while the slave is in PREOP.
+        try:
+            self.map_process_data()
+            master.read_state()
+            self._slaves = [
+                replace(info, state=EtherCatState(int(slave.state) & 0x0F), raw_state=int(slave.state))
+                for info, slave in zip(self._slaves, master.slaves, strict=True)
+            ]
+        except Exception:
+            self._mapped = False
         return list(self._slaves)
 
     def read_states(self) -> list[SlaveInfo]:
@@ -226,39 +320,62 @@ class PysoemBackend:
                     state = EtherCatState(int(slave.state) & 0x0F)
                 except ValueError:
                     state = EtherCatState.NONE
-                refreshed.append(replace(cached, state=state, al_status=int(slave.al_status)))
+                refreshed.append(replace(
+                    cached, state=state, al_status=int(slave.al_status), raw_state=int(slave.state)
+                ))
             self._slaves = refreshed
         return list(self._slaves)
 
     def request_state(self, position: int | None, state: EtherCatState, timeout_us: int) -> list[SlaveInfo]:
         master = self._require_master()
         target = master if position is None else self._slave(position)
+        master.read_state()
+        if any((int(s.state) & 0x0F) in (0, 1) for s in master.slaves):
+            self._invalidate_mapping()
+        candidates = master.slaves if position is None else [target]
+        for slave in candidates:
+            raw = int(slave.state)
+            if raw & 0x10:
+                logger.warning(
+                    "Acknowledging %s: AL state 0x%02X, code 0x%04X",
+                    slave.name, raw, int(slave.al_status),
+                )
+                slave.state = (raw & 0x0F) | 0x10
+                slave.write_state()
+                actual = self._check_state(slave, raw & 0x0F, timeout_us)
+                if actual != (raw & 0x0F):
+                    raise self._state_transition_error(slave, state, actual, timeout_us)
 
-        # A direct PRE-OP -> SAFE-OP/OP request still needs the same PDO
-        # mapping setup as cyclic I/O. OP also requires one valid process-data
-        # exchange while the slave is in SAFE-OP before requesting OP.
+        if state in (EtherCatState.INIT, EtherCatState.PRE_OP):
+            self._invalidate_mapping()
         if state in (EtherCatState.SAFE_OP, EtherCatState.OP) and not self._mapped:
             self.map_process_data()
-
         if state is EtherCatState.OP:
-            current = int(getattr(target, "state", EtherCatState.NONE)) & 0x0F
-            if current not in (int(EtherCatState.SAFE_OP), int(EtherCatState.OP)):
-                target.state = int(EtherCatState.SAFE_OP)
-                target.write_state()
-                safe_actual = target.state_check(int(EtherCatState.SAFE_OP), timeout_us)
-                if (safe_actual & 0x0F) != int(EtherCatState.SAFE_OP):
-                    try:
-                        self.read_states()
-                    except Exception:
-                        pass
-                    raise self._state_transition_error(target, EtherCatState.SAFE_OP, safe_actual, timeout_us)
-            master.send_processdata(release_gil=True)
-            master.receive_processdata(2000, release_gil=True)
+            self._transition(target, EtherCatState.SAFE_OP, timeout_us)
+        self._transition(target, state, timeout_us)
+        return self.read_states()
 
+    def _transition(self, target: Any, state: EtherCatState, timeout_us: int) -> None:
         target.state = int(state)
         target.write_state()
-        actual = target.state_check(int(state), timeout_us)
-        if (actual & 0x0F) != int(state):
+        if state is EtherCatState.OP:
+            deadline = time.monotonic() + timeout_us / 1_000_000
+            while True:
+                snapshot = self.exchange_process_data(min(2000, timeout_us))
+                actual = self._check_state(target, int(state), min(1000, timeout_us))
+                if actual & 0x10:
+                    break
+                if actual == int(state) and snapshot.actual_wkc == snapshot.expected_wkc:
+                    return
+                if time.monotonic() >= deadline:
+                    if actual == int(state):
+                        raise CommunicationError(
+                            f"OP process data WKC {snapshot.actual_wkc}, expected {snapshot.expected_wkc}"
+                        )
+                    break
+        else:
+            actual = self._check_state(target, int(state), timeout_us)
+        if actual != int(state):
             # Keep the original transition failure if a follow-up state read
             # is unavailable. Diagnostics must never replace the root error.
             try:
@@ -266,7 +383,17 @@ class PysoemBackend:
             except Exception:
                 pass
             raise self._state_transition_error(target, state, actual, timeout_us)
-        return self.read_states()
+
+    def _check_state(self, target: Any, expected: int, timeout_us: int) -> int:
+        # SOEM returns only the low state nibble. The refreshed .state retains
+        # ErrorInd; a broadcast check additionally needs individual slave reads.
+        target.state_check(expected, timeout_us)
+        if target is self._master:
+            target.read_state()
+            if not target.slaves:
+                return 0
+            return next((int(s.state) for s in target.slaves if int(s.state) != expected), expected)
+        return int(target.state)
 
     def _state_transition_error(
         self, target: Any, requested: EtherCatState, actual: int, timeout_us: int
@@ -279,17 +406,16 @@ class PysoemBackend:
 
         diagnostics: list[str] = []
         for index, slave in enumerate(candidates, 1):
-            al_status = int(getattr(slave, "al_status", 0)) & 0xFFFF
-            al_code: int | None = None
+            al_status = int(getattr(slave, "state", actual)) & 0xFFFF
+            al_code = int(getattr(slave, "al_status", 0)) & 0xFFFF
             try:
-                al_code = int.from_bytes(slave._fprd(0x0134, 2, timeout_us), "little")
+                al_code = int.from_bytes(slave._fprd(0x0134, 2, min(timeout_us, 2000)), "little")
             except Exception:
                 pass
             name = str(getattr(slave, "name", "")).strip() or f"slave {index}"
             detail = f"{name} AL status 0x{al_status:04X}"
-            if al_code is not None:
-                detail += f", AL status code 0x{al_code:04X}"
-                detail += f" ({al_status_info(al_code).name})"
+            detail += f", AL status code 0x{al_code:04X}"
+            detail += f" ({al_status_info(al_code).name})"
             diagnostics.append(detail)
 
         details = "; ".join(diagnostics) or "AL status unavailable"
@@ -298,9 +424,11 @@ class PysoemBackend:
         )
 
     def reconfig(self, position: int, timeout_us: int) -> bool:
+        self._invalidate_mapping()
         return bool(self._slave(position).reconfig(timeout_us))
 
     def recover(self, position: int, timeout_us: int) -> bool:
+        self._invalidate_mapping()
         return bool(self._slave(position).recover(timeout_us))
 
     @staticmethod
@@ -317,6 +445,8 @@ class PysoemBackend:
             raise self._normalize_error(exc, f"SDO read 0x{index:04X}:{subindex:02X}") from exc
 
     def sdo_write(self, position: int, index: int, subindex: int, data: bytes) -> None:
+        if 0x1600 <= index <= 0x1BFF or index in (0x1C12, 0x1C13):
+            self._invalidate_mapping()
         try:
             self._slave(position).sdo_write(index, subindex, bytes(data), ca=False, release_gil=True)
         except Exception as exc:
@@ -360,16 +490,37 @@ class PysoemBackend:
 
     def map_process_data(self) -> int:
         master = self._require_master()
+        self.request_state(None, EtherCatState.PRE_OP, 2_000_000)
+        manual = master.manual_state_change
         try:
+            # The caller explicitly requests SAFEOP after configuration succeeds.
+            master.manual_state_change = True
             size = int(master.config_map())
         except Exception as exc:
             raise self._normalize_error(exc, "PDO mapping") from exc
+        finally:
+            master.manual_state_change = manual
         self._mapped = True
         self._slaves = [
-            replace(info, input_size=len(master.slaves[i].input), output_size=len(master.slaves[i].output))
+            replace(
+                info, input_size=len(master.slaves[i].input), output_size=len(master.slaves[i].output),
+                pdo_size_source="mapped",
+            )
             for i, info in enumerate(self._slaves)
         ]
+        for info, slave in zip(self._slaves, master.slaves, strict=True):
+            self._pdo_size_cache[
+                (info.identity.vendor_id, info.identity.product_code, info.identity.revision)
+            ] = (len(slave.input), len(slave.output))
         return size
+
+    def _invalidate_mapping(self) -> None:
+        self._mapped = False
+        self._slaves = [
+            replace(info, pdo_size_source="cache")
+            if info.input_size is not None and info.output_size is not None else info
+            for info in self._slaves
+        ]
 
     def exchange_process_data(self, timeout_us: int) -> ProcessDataSnapshot:
         master = self._require_master()
@@ -430,6 +581,8 @@ class PysoemBackend:
     def register_write(self, position: int, address: int, data: bytes, timeout_us: int) -> None:
         if not data or not 0 <= address <= 0xFFFF or address + len(data) > 0x10000:
             raise ValueError("Register range is invalid")
+        if address < 0x0900 and address + len(data) > 0x0600:
+            self._invalidate_mapping()
         try:
             self._slave(position)._fpwr(address, bytes(data), timeout_us)
         except Exception as exc:
