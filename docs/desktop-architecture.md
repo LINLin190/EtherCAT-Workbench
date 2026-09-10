@@ -37,7 +37,7 @@ The shell has a compact labeled navigation rail, a contextual slave panel, and o
 3. EEPROM
 4. Settings
 
-CoE objects, PDO mapping, and Online I/O remain implemented but are temporarily hidden while the three primary workspaces are refined. Startup performs protocol/state initialization only. Adapter discovery, connection, and slave scanning are explicit user actions and never gate UI availability.
+CoE objects, PDO mapping, and Online I/O remain implemented but are temporarily hidden while the three primary workspaces are refined. Startup enumerates adapters and performs automatic connection/scanning when possible. Discovery performs one safe PDO mapping to obtain authoritative I/O widths and caches fixed identity/PDI data; state controls use automatic intermediate transitions.
 
 At 2560×1440 the content is capped at 1840 px. At 1920×1080 it is fluid. The compatibility floor is 1280×720.
 

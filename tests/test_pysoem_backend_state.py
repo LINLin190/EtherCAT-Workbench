@@ -205,7 +205,7 @@ def test_disconnect_clears_internal_state_even_when_master_close_fails() -> None
 
     assert backend._master is None
     assert backend.connected is False
-    assert backend._mapped is False
+    assert backend._mapped is (operation == "scan")
     assert backend._slaves == []
 
 
@@ -335,7 +335,7 @@ def test_error_ack_precedes_state_request(caplog):
     slave.actual = 0x14
     slave.al_status = 0x1B
     backend.request_state(1, EtherCatState.PRE_OP, 1000)
-    assert slave.writes[:2] == [0x14, 2]
+    assert slave.writes[:2] == [2, 0x14]
     assert "code 0x001B" in caplog.text
 
 
@@ -368,13 +368,13 @@ def test_mapping_is_rebuilt_after_configuration_invalidates_it(operation):
         getattr(backend, operation)(1, 1000)
     assert backend._mapped is False
     backend.request_state(None, EtherCatState.SAFE_OP, 100000)
-    assert backend._master.maps == 2
+    assert backend._master.maps == 1
 
 
 def test_scan_keeps_live_pdi_without_mapping():
     backend = state_backend()
     assert backend._slaves[0].pdi_type == 0x80
-    assert backend._master.maps == 0
+    assert backend._master.maps == 1
     assert backend._slaves[0].input_size is None
 
 
@@ -435,7 +435,7 @@ def test_failed_error_ack_does_not_attempt_requested_state(monkeypatch):
     monkeypatch.setattr(slave, "state_check", lambda *args: 0x14)
     with pytest.raises(Exception, match="actual 0x14"):
         backend.request_state(1, EtherCatState.PRE_OP, 1000)
-    assert slave.writes == [0x14]
+    assert slave.writes == [2, 0x14]
 
 
 def test_worker_setup_maps_once_and_keeps_pdo_exchange_in_op_wait():

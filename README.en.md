@@ -7,7 +7,7 @@ An EtherCAT slave debugging and diagnostics workbench for Windows. The desktop a
 This project uses [pySOEM](https://github.com/bnjmnp/pysoem) for EtherCAT master communication. Real mode on Windows depends on the official [Npcap](https://npcap.com/) driver; Npcap is not included in this repository or application.
 
 > [!WARNING]
-> The application defaults to **Real** mode, but startup does not open an adapter, connect, scan the bus, or write hardware automatically. Demo/Mock is enabled only in Settings and remains visibly marked. Real-mode state transitions, register writes, and EEPROM operations can affect machinery or make a slave temporarily unavailable. Use an isolated, recoverable test setup.
+> The application defaults to **Real** mode, but startup enumerates adapters and automatically attempts connection and bus scanning, but never writes hardware. Demo/Mock is enabled only in Settings and remains visibly marked. Real-mode state transitions, register writes, and EEPROM operations can affect machinery or make a slave temporarily unavailable. Use an isolated, recoverable test setup.
 
 ## Why EtherCAT Workbench
 
@@ -66,7 +66,7 @@ The public workflow is `1. Detect adapter -> 2. Connect -> 3. Scan -> 4. Select 
 
 1. In Real mode, detect and select the EtherCAT adapter; Demo/Mock is enabled in Settings.
 2. Click **Connect**, then **Scan**, and select the target in the slave tree.
-3. Read actual state and AL status first. Request states in the normal sequence `INIT -> PRE-OP -> SAFE-OP -> OP`; state, reconfigure, recovery, and EEPROM controls are unavailable during cyclic communication.
+3. Read actual state and AL status first. State buttons may request a target directly; the backend performs required intermediate transitions and stops cyclic communication before downgrading. Discovery maps PDOs once and caches fixed I/O widths.
 4. In Registers, read before writing and confirm the slave, catalog, address, current value, and target value. Regenerate plans older than 60 seconds.
 5. For EEPROM, stop cyclic communication and put the target in INIT. Back up a BIN first, then select XML/Device, inspect Smart View and capacity, and program or restore.
 
