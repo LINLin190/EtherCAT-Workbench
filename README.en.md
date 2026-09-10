@@ -7,7 +7,7 @@ An EtherCAT slave debugging and diagnostics workbench for Windows. The desktop a
 This project uses [pySOEM](https://github.com/bnjmnp/pysoem) for EtherCAT master communication. Real mode on Windows depends on the official [Npcap](https://npcap.com/) driver; Npcap is not included in this repository or application.
 
 > [!WARNING]
-> The application defaults to **Real** mode, but startup enumerates adapters and automatically attempts connection and bus scanning, but never writes hardware. Demo/Mock is enabled only in Settings and remains visibly marked. Real-mode state transitions, register writes, and EEPROM operations can affect machinery or make a slave temporarily unavailable. Use an isolated, recoverable test setup.
+> The application defaults to **Real** mode. Startup enumerates adapters and attempts connection and bus scanning. Discovery configures slaves to PRE-OP and maps PDOs to read fixed I/O widths; it does not enter OP or start cyclic communication. Demo/Mock is enabled only in Settings and remains visibly marked. Real-mode state transitions, register writes, and EEPROM operations can affect machinery or make a slave temporarily unavailable. Use an isolated, recoverable test setup.
 
 ## Why EtherCAT Workbench
 
@@ -15,7 +15,7 @@ EtherCAT Workbench brings bus discovery, state diagnostics, ESC register inspect
 
 | Concern | Implementation |
 | --- | --- |
-| Safe first contact | Real mode does not auto-connect; Demo/Mock is enabled only in Settings and is clearly marked |
+| Safe first contact | Real startup scans and stops in PRE-OP; it does not enter OP or start cyclic communication; Demo/Mock is enabled only in Settings and is clearly marked |
 | Responsive UI | The WebView never calls pySOEM; hardware work runs asynchronously in the Python bridge |
 | Request consistency | One Worker serializes requests for one Master |
 | Write control | Registers use two-stage plans and readback; EEPROM uses capacity, structure, semantic, and full-image verification |
@@ -62,10 +62,10 @@ pnpm dev
 
 ### Recommended workflow
 
-The public workflow is `1. Detect adapter -> 2. Connect -> 3. Scan -> 4. Select slave -> 5. Read state and AL -> 6. Register or EEPROM diagnostics`.
+The public workflow is `1. Automatic or manual scan -> 2. Select slave -> 3. Read state and AL -> 4. Register or EEPROM diagnostics`.
 
-1. In Real mode, detect and select the EtherCAT adapter; Demo/Mock is enabled in Settings.
-2. Click **Connect**, then **Scan**, and select the target in the slave tree.
+1. In Real mode, startup attempts connection and scanning; use **Detect and scan** to run it again. Demo/Mock is enabled in Settings.
+2. If automatic scanning finds no slave, select an adapter, click **Connect**, then **Scan**, and select the target in the slave tree. Discovery maps PDOs in PRE-OP and caches identity, PDI, and I/O widths.
 3. Read actual state and AL status first. State buttons may request a target directly; the backend performs required intermediate transitions and stops cyclic communication before downgrading. Discovery maps PDOs once and caches fixed I/O widths.
 4. In Registers, read before writing and confirm the slave, catalog, address, current value, and target value. Regenerate plans older than 60 seconds.
 5. For EEPROM, stop cyclic communication and put the target in INIT. Back up a BIN first, then select XML/Device, inspect Smart View and capacity, and program or restore.
@@ -107,7 +107,7 @@ Supported: ConfigData/CRC-8, Identity, standard Mailbox, Strings, General, FMMU,
 
 ## ESC profiles and identification
 
-`chip_model` and `register_family` are stored separately. Profiles include E101, E252, E253, ET1100, LAN9252, LAN9253, and Generic ESC; domestic models are not displayed as original vendor chips. Identification uses ESI model text or chip-type register `0x0E00`, not guesses from FMMU/SM counts or RAM ranges. Vendor-specific registers, exact encodings, EEPROM timing, and reset compatibility for E101/E252/E253 remain unverified on physical hardware.
+`chip_model` and `register_family` are stored separately. Profiles include E101, E252, E253, ET1100, LAN9252, LAN9253, and Generic ESC; domestic models are not displayed as original vendor chips. Identification first uses ESC type register `0x0000` (`0x11` for ET1100) and chip identification register `0x0E02` (LAN9252/LAN9253), then uses legacy identifiers and FMMU, SyncManager, and RAM traits only as a LAN9252 fallback. Vendor-specific registers, exact encodings, EEPROM timing, and reset compatibility for E101/E252/E253 remain unverified on physical hardware.
 
 ## Developer guide
 
@@ -136,7 +136,7 @@ Before distributing an application bundle, verify WebView2, the Python bridge, p
 
 ### Tests and build checks
 
-Automated tests use only the Mock backend and included ESI/BIN fixtures. They do not open a physical adapter or write real PDO outputs, EEPROM, or registers.
+Automated tests use Mock backends and versioned ESI/BIN fixtures. A local LYW ESI regression test is skipped when its optional external fixture is absent. They do not open a physical adapter or write real PDO outputs, EEPROM, or registers.
 
 ```powershell
 python -m ruff check src tests
@@ -153,13 +153,13 @@ Current visual acceptance targets are `2560 x 1440` (default), `1920 x 1080`, an
 > [!CAUTION]
 > Passing Mock tests does not establish physical EtherCAT hardware verification.
 
-- Npcap opening, real state transitions, EEPROM timing, and complex-topology rediscovery after reset require an isolated test device;
+- One E252-EVB-SPI slave has verified PRE-OP mapping of 6 B input and 2 B output, short PDO cyclic communication, and several state-change rounds. Twenty rounds and multi-slave topologies still require isolated-device validation;
 - the firmware/PDI paths behind INIT-to-PRE-OP `0x0050`/`0x0051` require device documentation or captures;
 - vendor bit fields, private registers, and exact chip encodings for E101/E252/E253 require datasheets or hardware captures;
 - vendor-private SII Categories and arbitrary complete ESI Schema conversion are outside the current support claim;
 - CoE, PDO mapping, and online I/O pages are hidden in this release; the standard register catalog does not claim complete coverage of every vendor extension.
 
-For first physical contact, use read-only steps: enumerate adapters, connect, scan, read state/AL, read registers, and read and store an EEPROM BIN offline. Confirm that the backup parses and that the equipment is safe before validating writes on an isolated test slave.
+For first physical contact, enumerate adapters, connect and scan (PRE-OP/PDO mapping), read state/AL, read registers, and read and store an EEPROM BIN offline. Confirm that the backup parses and that the equipment is safe before validating writes on an isolated test slave.
 
 ## Safety notice
 
