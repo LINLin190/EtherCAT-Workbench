@@ -142,7 +142,10 @@ def test_corrupt_header_and_missing_end_marker_are_rejected(workspace: Path) -> 
 def test_large_lyw_esi_generates_capacity_safe_sii(workspace: Path) -> None:
     import struct
 
-    document = EsiParser().parse(workspace / "LYW_CanMotor_SIP-V2.2" / "XHD_CAN_Motor_18x8.xml")
+    path = workspace / "LYW_CanMotor_SIP-V2.2" / "XHD_CAN_Motor_18x8.xml"
+    if not path.exists():
+        pytest.skip("optional local LYW ESI fixture is not available")
+    document = EsiParser().parse(path)
     device = document.devices[0]
 
     report = SiiGenerator().generate(device)

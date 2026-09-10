@@ -205,7 +205,7 @@ def test_disconnect_clears_internal_state_even_when_master_close_fails() -> None
 
     assert backend._master is None
     assert backend.connected is False
-    assert backend._mapped is (operation == "scan")
+    assert backend._mapped is False
     assert backend._slaves == []
 
 
@@ -332,10 +332,11 @@ def test_op_with_bad_wkc_is_not_reported_as_success():
 def test_error_ack_precedes_state_request(caplog):
     backend = state_backend()
     slave = backend._master.slaves[0]
+    slave.writes.clear()
     slave.actual = 0x14
     slave.al_status = 0x1B
     backend.request_state(1, EtherCatState.PRE_OP, 1000)
-    assert slave.writes[:2] == [2, 0x14]
+    assert slave.writes == [0x14, 2]
     assert "code 0x001B" in caplog.text
 
 
@@ -351,6 +352,7 @@ def test_preop_error_bit_is_preserved_and_rejected():
 
 def test_init_to_op_prepares_preop_before_mapping():
     backend = state_backend()
+    backend._master.slaves[0].writes.clear()
     backend._master.slaves[0].actual = 1
     backend.request_state(None, EtherCatState.OP, 100000)
     assert backend._master.slaves[0].writes[0] == 2
@@ -366,16 +368,17 @@ def test_mapping_is_rebuilt_after_configuration_invalidates_it(operation):
         backend.scan()
     else:
         getattr(backend, operation)(1, 1000)
-    assert backend._mapped is False
+    assert backend._mapped is (operation == "scan")
     backend.request_state(None, EtherCatState.SAFE_OP, 100000)
-    assert backend._master.maps == 1
+    assert backend._master.maps == 2
 
 
-def test_scan_keeps_live_pdi_without_mapping():
+def test_scan_maps_pdos_and_keeps_live_pdi():
     backend = state_backend()
     assert backend._slaves[0].pdi_type == 0x80
     assert backend._master.maps == 1
-    assert backend._slaves[0].input_size is None
+    assert (backend._slaves[0].input_size, backend._slaves[0].output_size) == (6, 2)
+    assert backend._slaves[0].pdo_size_source == "mapped"
 
 
 def test_sii_scan_reads_declared_sm_sizes_without_mailbox():
@@ -431,17 +434,18 @@ def test_failed_rescan_clears_old_mapping_and_topology(monkeypatch):
 def test_failed_error_ack_does_not_attempt_requested_state(monkeypatch):
     backend = state_backend()
     slave = backend._master.slaves[0]
+    slave.writes.clear()
     slave.actual = 0x14
     monkeypatch.setattr(slave, "state_check", lambda *args: 0x14)
     with pytest.raises(Exception, match="actual 0x14"):
         backend.request_state(1, EtherCatState.PRE_OP, 1000)
-    assert slave.writes == [2, 0x14]
+    assert slave.writes == [0x14]
 
 
-def test_worker_setup_maps_once_and_keeps_pdo_exchange_in_op_wait():
+def test_worker_setup_remaps_once_and_keeps_pdo_exchange_in_op_wait():
     from ethercat_debug_tool.worker.ethercat_worker import EtherCatWorker
 
     backend = state_backend()
     EtherCatWorker._configure_cycle(backend, 5, 2000, 5)
-    assert backend._master.maps == 1
+    assert backend._master.maps == 2
     assert backend._master.exchanges >= 3
